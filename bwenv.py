@@ -8,9 +8,11 @@ tool delegates authentication and vault access to the official ``bw`` CLI.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -43,6 +45,14 @@ class KeychainError(BWEnvError):
     """The macOS Keychain cannot provide the requested session."""
 
 
+class ImportValidationError(BWEnvError):
+    """The fallback file is unsafe or cannot be imported deterministically."""
+
+
+class ImportCollisionError(BWEnvError):
+    """An import target already exists and must be resolved by an operator."""
+
+
 @dataclass(frozen=True)
 class OpReference:
     organization: str
@@ -56,6 +66,26 @@ class OpReference:
     @property
     def uri(self) -> str:
         return f"{self.item_uri}/{self.field}"
+
+
+@dataclass(frozen=True)
+class ImportField:
+    name: str
+    value: str
+
+
+@dataclass(frozen=True)
+class ImportItem:
+    organization: str
+    name: str
+    fields: tuple[ImportField, ...]
+
+
+@dataclass(frozen=True)
+class FallbackImportPlan:
+    items: tuple[ImportItem, ...]
+    reference_count: int
+    skipped_non_op_count: int
 
 
 class URIParser:
@@ -320,6 +350,198 @@ def write_output(path: Path, content: str, *, mode: int, force: bool,
         raise
 
 
+def load_fallback_import_plan(path: Path) -> FallbackImportPlan:
+    """Load a 1Password fallback export without exposing any secret value."""
+    try:
+        file_stat = path.stat()
+    except FileNotFoundError as error:
+        raise ImportValidationError(f"fallback file does not exist: {path}") from error
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ImportValidationError("fallback path is not a regular file")
+    if stat.S_IMODE(file_stat.st_mode) & 0o077:
+        raise ImportValidationError("fallback file permissions must be 0600 or stricter")
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ImportValidationError("fallback file is not valid JSON") from error
+    if not isinstance(document, dict) or not isinstance(document.get("secrets"), dict):
+        raise ImportValidationError("fallback file must contain a secrets object")
+
+    grouped: dict[tuple[str, str], dict[str, str]] = {}
+    skipped_non_op_count = 0
+    reference_count = 0
+    for uri, record in document["secrets"].items():
+        if not isinstance(uri, str) or not uri.startswith("op://"):
+            skipped_non_op_count += 1
+            continue
+        try:
+            reference = parse_op_reference(uri)
+        except ResolutionError as error:
+            raise ImportValidationError(f"invalid fallback reference: {uri}") from error
+        if not isinstance(record, dict):
+            raise ImportValidationError(f"invalid fallback entry for {uri}")
+        value = record.get("value")
+        if not isinstance(value, str) or not value:
+            raise ImportValidationError(f"empty or non-text fallback value for {uri}")
+        item_fields = grouped.setdefault((reference.organization, reference.item), {})
+        if reference.field in item_fields:
+            raise ImportValidationError(f"duplicate fallback field for {reference.uri}")
+        item_fields[reference.field] = value
+        reference_count += 1
+
+    items = tuple(
+        ImportItem(
+            organization=organization,
+            name=item_name,
+            fields=tuple(ImportField(name, value) for name, value in sorted(fields.items())),
+        )
+        for (organization, item_name), fields in sorted(grouped.items())
+    )
+    if not items:
+        raise ImportValidationError("fallback file has no importable op:// references")
+    return FallbackImportPlan(items, reference_count, skipped_non_op_count)
+
+
+def render_fallback_import_dry_run(plan: FallbackImportPlan) -> str:
+    """Render structural data only; values deliberately never enter this report."""
+    by_organization: dict[str, tuple[int, int]] = {}
+    for item in plan.items:
+        item_count, field_count = by_organization.get(item.organization, (0, 0))
+        by_organization[item.organization] = (item_count + 1, field_count + len(item.fields))
+    lines = [
+        "bwenv: 1Password fallback import dry run (no Vaultwarden access)",
+        f"references: {plan.reference_count}",
+        f"items: {len(plan.items)}",
+        f"skipped non-op entries: {plan.skipped_non_op_count}",
+        "organizations:",
+    ]
+    for organization, (item_count, field_count) in sorted(by_organization.items()):
+        item_label = "item" if item_count == 1 else "items"
+        field_label = "field" if field_count == 1 else "fields"
+        lines.append(f"- {organization}: {item_count} {item_label}, {field_count} {field_label}")
+    return "\n".join(lines) + "\n"
+
+
+def _default_bw_input_runner(args: list[str], env: Mapping[str, str], input_text: str | None) -> str:
+    try:
+        result = subprocess.run(
+            ["bw", *args],
+            input=input_text,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=dict(env),
+        )
+    except FileNotFoundError as error:
+        raise BWEnvError("Bitwarden CLI 'bw' was not found") from error
+    if result.returncode != 0:
+        raise BWEnvError(f"Bitwarden command failed: {' '.join(args[:2])}")
+    return result.stdout
+
+
+class VaultImportWriter:
+    """Create new organization items only after a complete collision preflight."""
+
+    def __init__(
+        self,
+        session: str,
+        *,
+        sync: bool,
+        runner: Callable[[list[str], Mapping[str, str], str | None], str] = _default_bw_input_runner,
+    ):
+        self.session = session
+        self.sync = sync
+        self.runner = runner
+
+    def _environment(self) -> dict[str, str]:
+        environment = dict(os.environ)
+        environment["BW_SESSION"] = self.session
+        return environment
+
+    def _run(self, args: list[str], input_text: str | None = None) -> str:
+        try:
+            return self.runner(args, self._environment(), input_text)
+        except BWEnvError:
+            raise
+        except Exception as error:
+            raise BWEnvError(f"Bitwarden command failed: {' '.join(args[:2])}") from error
+
+    def _prepare(self) -> None:
+        try:
+            status = json.loads(self._run(["status"]))
+        except json.JSONDecodeError as error:
+            raise BWEnvError("Bitwarden returned invalid status JSON") from error
+        if not isinstance(status, dict) or status.get("status") != "unlocked":
+            raise BWEnvError("Bitwarden vault is not unlocked; refresh the configured session")
+        if self.sync:
+            self._run(["sync"])
+
+    @staticmethod
+    def _exact_id(entries: list[dict], name: str, kind: str) -> str:
+        matches = [entry.get("id") for entry in entries if entry.get("name") == name]
+        if len(matches) != 1 or not isinstance(matches[0], str) or not matches[0]:
+            raise ImportValidationError(f"expected exactly one {kind}: {name}")
+        return matches[0]
+
+    def _preflight(self, plan: FallbackImportPlan, collections: Mapping[str, str]) -> dict[str, tuple[str, str]]:
+        self._prepare()
+        organizations = _json_list(self._run(["list", "organizations"]), "list organizations")
+        all_items = _json_list(self._run(["list", "items"]), "list items")
+        targets: dict[str, tuple[str, str]] = {}
+        for organization in sorted({item.organization for item in plan.items}):
+            if organization not in collections:
+                raise ImportValidationError(f"missing collection mapping for organization: {organization}")
+            organization_id = self._exact_id(organizations, organization, "organization")
+            organization_collections = _json_list(
+                self._run(["list", "org-collections", "--organizationid", organization_id]),
+                "list org-collections",
+            )
+            collection_id = self._exact_id(
+                organization_collections, collections[organization], f"collection in {organization}"
+            )
+            targets[organization] = (organization_id, collection_id)
+
+        collisions = [
+            item
+            for item in plan.items
+            if any(
+                existing.get("organizationId") == targets[item.organization][0]
+                and existing.get("name") == item.name
+                for existing in all_items
+            )
+        ]
+        if collisions:
+            raise ImportCollisionError("one or more target items already exist; refusing to overwrite")
+        return targets
+
+    def apply(self, plan: FallbackImportPlan, collections: Mapping[str, str]) -> None:
+        targets = self._preflight(plan, collections)
+        try:
+            item_template = json.loads(self._run(["get", "template", "item"]))
+        except json.JSONDecodeError as error:
+            raise BWEnvError("Bitwarden returned an invalid item template") from error
+        if not isinstance(item_template, dict):
+            raise BWEnvError("Bitwarden returned an invalid item template")
+        for planned in plan.items:
+            organization_id, collection_id = targets[planned.organization]
+            item = copy.deepcopy(item_template)
+            item["name"] = planned.name
+            item["organizationId"] = organization_id
+            item["collectionIds"] = [collection_id]
+            item["fields"] = [
+                {"name": field.name, "value": field.value, "type": 0} for field in planned.fields
+            ]
+            encoded = self._run(["encode"], json.dumps(item, separators=(",", ":")))
+            self._run(["create", "item"], encoded)
+
+
+def parse_collection_mapping(value: str) -> tuple[str, str]:
+    organization, separator, collection = value.partition("=")
+    if not separator or not organization or not collection:
+        raise argparse.ArgumentTypeError("collection mapping must be ORGANIZATION=COLLECTION")
+    return organization, collection
+
+
 def run_command(command: Sequence[str], environment: Mapping[str, str], resolver: VaultResolver,
                 runner: Callable[[Sequence[str], Mapping[str, str]], int] | None = None) -> int:
     if not command:
@@ -407,6 +629,20 @@ def build_parser() -> argparse.ArgumentParser:
     inject.add_argument("-o", "--out-file", type=Path)
     inject.add_argument("--file-mode", type=parse_file_mode, default=0o600)
     inject.add_argument("-f", "--force", action="store_true")
+    fallback_import = commands.add_parser(
+        "import-1password-fallback",
+        help="dry-run or import a 0600 1Password fallback export without printing values",
+    )
+    fallback_import.add_argument("--file", required=True, type=Path)
+    fallback_import.add_argument("--apply", action="store_true")
+    fallback_import.add_argument(
+        "--collection",
+        action="append",
+        type=parse_collection_mapping,
+        default=[],
+        metavar="ORGANIZATION=COLLECTION",
+        help="required with --apply, once for every imported organization",
+    )
     keychain = commands.add_parser("keychain", help="manage a BW_SESSION in the macOS Keychain")
     keychain_commands = keychain.add_subparsers(dest="keychain_command", required=True)
     for name in ("set-session", "delete-session", "status"):
@@ -426,6 +662,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 store.delete()
             else:
                 store.get()
+            return 0
+        if args.command == "import-1password-fallback":
+            plan = load_fallback_import_plan(args.file)
+            if not args.apply:
+                sys.stdout.write(render_fallback_import_dry_run(plan))
+                return 0
+            if not args.keychain_service:
+                raise ImportValidationError("--apply requires --keychain-service before the command")
+            collection_mappings = dict(args.collection)
+            imported_organizations = {item.organization for item in plan.items}
+            if len(collection_mappings) != len(args.collection) or set(collection_mappings) != imported_organizations:
+                raise ImportValidationError("--apply requires one unique --collection mapping per organization")
+            session = KeychainSessionStore(args.keychain_service).get()
+            VaultImportWriter(session, sync=not args.no_sync).apply(plan, collection_mappings)
+            print(f"bwenv: imported {plan.reference_count} references into {len(plan.items)} new items")
             return 0
         resolver = _resolver_from_args(args)
         if args.command == "read":

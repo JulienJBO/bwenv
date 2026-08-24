@@ -79,6 +79,39 @@ python3 bwenv.py --keychain-service bwenv.bitwarden-poc.kefapps.wtf run -- ./ser
 `BW_SESSION` is used only while `bwenv` queries `bw`; it is removed before the
 child process starts. Diagnostics never include resolved values or `bw` stderr.
 
+## Import a 1Password fallback export
+
+The import command accepts the protected fallback JSON produced for the
+1Password quota incident. It requires a regular file with mode `0600` (or
+stricter), reads only `secrets`, and imports only valid `op://` entries. Entries
+such as `OP_SERVICE_ACCOUNT_TOKEN` are excluded automatically.
+
+Run the local, value-free dry-run first:
+
+```sh
+python3 bwenv.py import-1password-fallback \
+  --file /Users/jbodin/messenger-connector-secrets-fallback.json
+```
+
+The dry-run does not invoke `bw` and prints only counts by organisation. To
+apply, first create the target organizations and one existing collection in
+each of them. `bwenv` does not create organizations or collections. It refuses
+to overwrite an item with the same organization and name, and performs all
+organization, collection, and collision checks before creating the first item.
+
+```sh
+python3 bwenv.py --keychain-service bwenv.bitwarden-poc.kefapps.wtf \
+  import-1password-fallback \
+  --file /Users/jbodin/messenger-connector-secrets-fallback.json \
+  --apply \
+  --collection Infra=Deployments \
+  --collection 'Personal Ops=Deployments'
+```
+
+Each imported item stores every path field as a custom Bitwarden field, which
+preserves the `op://organisation/item/champ` contract exactly. `--apply` is the
+only command that sends a fallback value to Vaultwarden.
+
 ## LaunchAgents
 
 Copy and adapt

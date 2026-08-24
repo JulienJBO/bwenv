@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -246,6 +246,114 @@ class ProcessIntegrationTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertEqual("TOKEN=subprocess-token\n", result.stdout)
             self.assertNotIn("SENTINEL_SECRET_FROM_BW_STDERR", result.stderr)
+
+
+class FallbackImportTests(unittest.TestCase):
+    def fallback_file(self, directory, mode=0o600):
+        source = Path(directory) / "fallback.json"
+        source.write_text(
+            bwenv.json.dumps(
+                {
+                    "secrets": {
+                        "op://Infra/service/token": {"value": "DO_NOT_PRINT_TOKEN"},
+                        "op://Infra/service/username": {"value": "DO_NOT_PRINT_USERNAME"},
+                        "op://Personal Ops/other/key": {"value": "DO_NOT_PRINT_KEY"},
+                        "OP_SERVICE_ACCOUNT_TOKEN": {"value": "DO_NOT_PRINT_OP_TOKEN"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        source.chmod(mode)
+        return source
+
+    def test_plan_groups_fields_and_excludes_non_op_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = bwenv.load_fallback_import_plan(self.fallback_file(directory))
+        self.assertEqual(3, plan.reference_count)
+        self.assertEqual(1, plan.skipped_non_op_count)
+        self.assertEqual(2, len(plan.items))
+        self.assertEqual(["token", "username"], [field.name for field in plan.items[0].fields])
+
+    def test_dry_run_never_prints_fallback_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = self.fallback_file(directory)
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                self.assertEqual(0, bwenv.main(["import-1password-fallback", "--file", str(source)]))
+        output = stdout.getvalue()
+        self.assertIn("references: 3", output)
+        self.assertIn("Infra: 1 item, 2 fields", output)
+        self.assertNotIn("DO_NOT_PRINT", output)
+
+    def test_import_rejects_a_group_or_world_readable_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = self.fallback_file(directory, mode=0o644)
+            with self.assertRaisesRegex(bwenv.ImportValidationError, "permissions"):
+                bwenv.load_fallback_import_plan(source)
+
+    def test_apply_creates_only_preflighted_organization_items(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = bwenv.load_fallback_import_plan(self.fallback_file(directory))
+        calls = []
+
+        def runner(args, env, input_text):
+            calls.append((args, env.copy(), input_text))
+            if args == ["status"]:
+                return '{"status":"unlocked"}'
+            if args == ["list", "organizations"]:
+                return bwenv.json.dumps([
+                    {"id": "infra-id", "name": "Infra"},
+                    {"id": "ops-id", "name": "Personal Ops"},
+                ])
+            if args == ["list", "items"]:
+                return "[]"
+            if args == ["list", "org-collections", "--organizationid", "infra-id"]:
+                return bwenv.json.dumps([{"id": "infra-collection", "name": "Deployments"}])
+            if args == ["list", "org-collections", "--organizationid", "ops-id"]:
+                return bwenv.json.dumps([{"id": "ops-collection", "name": "Deployments"}])
+            if args == ["get", "template", "item"]:
+                return '{"type":1,"name":null,"fields":null,"login":null}'
+            if args == ["encode"]:
+                return "encoded-item"
+            if args == ["create", "item"]:
+                return '{"id":"created"}'
+            raise AssertionError(f"unexpected bw call: {args}")
+
+        writer = bwenv.VaultImportWriter("session-sentinel", sync=False, runner=runner)
+        writer.apply(plan, {"Infra": "Deployments", "Personal Ops": "Deployments"})
+        creates = [call for call in calls if call[0] == ["create", "item"]]
+        self.assertEqual(2, len(creates))
+        self.assertTrue(all(call[1]["BW_SESSION"] == "session-sentinel" for call in calls))
+        encoded_payloads = [call[2] for call in calls if call[0] == ["encode"]]
+        self.assertTrue(any("DO_NOT_PRINT_TOKEN" in payload for payload in encoded_payloads))
+
+    def test_apply_refuses_collision_before_any_create(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = bwenv.load_fallback_import_plan(self.fallback_file(directory))
+        calls = []
+
+        def runner(args, env, input_text):
+            calls.append(args)
+            if args == ["status"]:
+                return '{"status":"unlocked"}'
+            if args == ["list", "organizations"]:
+                return bwenv.json.dumps([
+                    {"id": "infra-id", "name": "Infra"},
+                    {"id": "ops-id", "name": "Personal Ops"},
+                ])
+            if args == ["list", "items"]:
+                return bwenv.json.dumps([{"organizationId": "infra-id", "name": "service"}])
+            if args == ["list", "org-collections", "--organizationid", "infra-id"]:
+                return bwenv.json.dumps([{"id": "infra-collection", "name": "Deployments"}])
+            if args == ["list", "org-collections", "--organizationid", "ops-id"]:
+                return bwenv.json.dumps([{"id": "ops-collection", "name": "Deployments"}])
+            raise AssertionError(f"unexpected bw call: {args}")
+
+        writer = bwenv.VaultImportWriter("session-sentinel", sync=False, runner=runner)
+        with self.assertRaises(bwenv.ImportCollisionError):
+            writer.apply(plan, {"Infra": "Deployments", "Personal Ops": "Deployments"})
+        self.assertNotIn(["create", "item"], calls)
 
 
 if __name__ == "__main__":
