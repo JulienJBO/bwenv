@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bwenv.runtime.example</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/ABSOLUTE/PATH/TO/bwenv.py</string>
+    <string>--keychain-service</string>
+    <string>bwenv.bitwarden-poc.kefapps.wtf</string>
+    <string>run</string>
+    <string>--</string>
+    <string>/ABSOLUTE/PATH/TO/service-command</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>SERVICE_TOKEN</key>
+    <string>op://Infra/service/token</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/REPLACE_ME/Library/Logs/com.bwenv.runtime.example.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/REPLACE_ME/Library/Logs/com.bwenv.runtime.example.error.log</string>
+</dict>
+</plist>
