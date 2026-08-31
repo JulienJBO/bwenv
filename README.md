@@ -1,8 +1,10 @@
 # bwenv
 
 `bwenv` resolves 1Password-style `op://` references from Bitwarden or
-Vaultwarden through the official `bw` CLI. It is intended for local use and
-macOS LaunchAgents, not CI.
+Vaultwarden through the official `bw` CLI. Version `2.0.0` is intended for
+local use and a GitHub Actions self-hosted macOS runner running as the same
+user that owns the Keychain entry; hosted GitHub runners and other users are
+not supported.
 
 ## Install and configure
 
@@ -14,6 +16,15 @@ bw config server https://bitwarden-poc.kefapps.wtf
 bw login
 bw unlock
 ```
+
+Install the explicit `bwenv` command:
+
+```sh
+./scripts/install-bwenv.sh
+```
+
+The installer creates only `~/.local/bin/bwenv` (or `BWENV_BIN_DIR`) and never
+replaces, aliases, or intercepts the official `op` command.
 
 The CLI must be unlocked whenever `bwenv` resolves a reference. For a
 LaunchAgent, save the resulting session in the logged-in user's macOS
@@ -58,6 +69,9 @@ python3 bwenv.py read op://Infra/service/token
 # Resolve environment variables whose entire value is op://... or bw://... .
 TOKEN=op://Infra/service/token python3 bwenv.py run -- ./service
 
+# Read an op-compatible env file before starting the child.
+bwenv run --env-file .env -- ./service
+
 # Inject braced or bare op:// references from stdin to stdout.
 printf 'token={{ op://Infra/service/token }}\n' | python3 bwenv.py inject
 
@@ -93,24 +107,39 @@ python3 bwenv.py import-1password-fallback \
   --file /Users/jbodin/messenger-connector-secrets-fallback.json
 ```
 
-The dry-run does not invoke `bw` and prints only counts by organisation. To
-apply, first create the target organizations and one existing collection in
-each of them. `bwenv` does not create organizations or collections. It refuses
-to overwrite an item with the same organization and name, and performs all
-organization, collection, and collision checks before creating the first item.
+The dry-run does not invoke `bw` and prints only counts by organisation plus a
+plan digest. To apply, first create the target organizations and one existing
+collection in each of them. `bwenv` does not create organizations or
+collections. It refuses to overwrite an item with the same organization and
+name, and performs all organization, collection, and collision checks before
+creating the first item.
 
 ```sh
 python3 bwenv.py --keychain-service bwenv.bitwarden-poc.kefapps.wtf \
   import-1password-fallback \
   --file /Users/jbodin/messenger-connector-secrets-fallback.json \
   --apply \
+  --plan-digest <digest-from-dry-run> \
+  --receipt /path/to/import-receipt.json \
   --collection Infra=Deployments \
   --collection 'Personal Ops=Deployments'
 ```
 
 Each imported item stores every path field as a custom Bitwarden field, which
-preserves the `op://organisation/item/champ` contract exactly. `--apply` is the
-only command that sends a fallback value to Vaultwarden.
+preserves the `op://organisation/item/champ` contract exactly, and stores the
+source URI in login URI metadata for renamed-item migrations. `--apply` is the
+only command that sends a fallback value to Vaultwarden. The receipt is
+structural, written atomically with mode `0600`, and lets a failed import
+resume safely with the same digest:
+
+```sh
+bwenv --keychain-service bwenv.bitwarden-poc.kefapps.wtf rollback \
+  --receipt /path/to/import-receipt.json
+```
+
+Rollback deletes only IDs in that receipt, verifies their absence, and is
+idempotent. Neither dry-run output, diagnostics, receipts, nor logs contain
+secret values or raw `bw` stderr.
 
 ## LaunchAgents
 
@@ -127,8 +156,11 @@ python3 -m py_compile bwenv.py
 
 ## CI boundary
 
-This tool never reads GitHub secrets or runs in GitHub Actions. Existing CI and
-deployment automation remain backed by AWS Secrets Manager and OIDC.
+The supported CI path is only a GitHub Actions self-hosted macOS runner under
+the same account as the configured Keychain service. The workflow installs and
+invokes `bwenv` explicitly; it does not pass `BW_SESSION`, a Bitwarden
+password, or an unlock token through GitHub Secrets. Hosted GitHub runners and
+generic CI environments are deliberately outside this support contract.
 
 ## License and provenance
 

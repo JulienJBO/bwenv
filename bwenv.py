@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import re
@@ -21,7 +22,9 @@ from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
 
+VERSION = "2.0.0"
 OP_URI_PATTERN = re.compile(r"^op://([^/]+)/([^/]+)/(.+)$")
+ENV_FILE_LINE_PATTERN = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 TEMPLATE_REFERENCE_PATTERN = re.compile(
     r"\{\{\s*(op://[^\s{}]+)\s*\}\}|(?<![A-Za-z0-9_])"
     r"(op://[A-Za-z0-9._~-]+/[A-Za-z0-9._~-]+/[A-Za-z0-9._~/%-]+)"
@@ -79,6 +82,7 @@ class ImportItem:
     organization: str
     name: str
     fields: tuple[ImportField, ...]
+    source_uris: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,6 +90,30 @@ class FallbackImportPlan:
     items: tuple[ImportItem, ...]
     reference_count: int
     skipped_non_op_count: int
+
+    @property
+    def digest(self) -> str:
+        """Return a stable application token without printing any secret value."""
+        payload = [
+            {
+                "organization": item.organization,
+                "name": item.name,
+                "fields": [{"name": field.name, "value": field.value} for field in item.fields],
+                "source_uris": list(item.source_uris),
+            }
+            for item in self.items
+        ]
+        encoded = json.dumps(
+            {
+                "items": payload,
+                "reference_count": self.reference_count,
+                "skipped_non_op_count": self.skipped_non_op_count,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
 
 class URIParser:
@@ -368,6 +396,7 @@ def load_fallback_import_plan(path: Path) -> FallbackImportPlan:
         raise ImportValidationError("fallback file must contain a secrets object")
 
     grouped: dict[tuple[str, str], dict[str, str]] = {}
+    source_uris: dict[tuple[str, str], set[str]] = {}
     skipped_non_op_count = 0
     reference_count = 0
     for uri, record in document["secrets"].items():
@@ -387,6 +416,9 @@ def load_fallback_import_plan(path: Path) -> FallbackImportPlan:
         if reference.field in item_fields:
             raise ImportValidationError(f"duplicate fallback field for {reference.uri}")
         item_fields[reference.field] = value
+        source_uris.setdefault((reference.organization, reference.item), set()).update(
+            (reference.item_uri, reference.uri)
+        )
         reference_count += 1
 
     items = tuple(
@@ -394,6 +426,7 @@ def load_fallback_import_plan(path: Path) -> FallbackImportPlan:
             organization=organization,
             name=item_name,
             fields=tuple(ImportField(name, value) for name, value in sorted(fields.items())),
+            source_uris=tuple(sorted(source_uris[(organization, item_name)])),
         )
         for (organization, item_name), fields in sorted(grouped.items())
     )
@@ -419,7 +452,30 @@ def render_fallback_import_dry_run(plan: FallbackImportPlan) -> str:
         item_label = "item" if item_count == 1 else "items"
         field_label = "field" if field_count == 1 else "fields"
         lines.append(f"- {organization}: {item_count} {item_label}, {field_count} {field_label}")
+    lines.append(f"plan digest: {plan.digest}")
     return "\n".join(lines) + "\n"
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    """Parse the dotenv subset accepted by ``op run --env-file``."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise BWEnvError(f"unable to read env-file: {path}") from error
+
+    values: dict[str, str] = {}
+    for line_number, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = ENV_FILE_LINE_PATTERN.fullmatch(stripped)
+        if match is None:
+            raise BWEnvError(f"invalid env-file syntax at line {line_number}")
+        key, value = match.groups()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key] = value
+    return values
 
 
 def _default_bw_input_runner(args: list[str], env: Mapping[str, str], input_text: str | None) -> str:
@@ -437,6 +493,45 @@ def _default_bw_input_runner(args: list[str], env: Mapping[str, str], input_text
     if result.returncode != 0:
         raise BWEnvError(f"Bitwarden command failed: {' '.join(args[:2])}")
     return result.stdout
+
+
+def _load_receipt(path: Path) -> dict:
+    try:
+        receipt_stat = path.stat()
+    except FileNotFoundError as error:
+        raise ImportValidationError(f"receipt does not exist: {path}") from error
+    if not stat.S_ISREG(receipt_stat.st_mode):
+        raise ImportValidationError("receipt path is not a regular file")
+    if stat.S_IMODE(receipt_stat.st_mode) & 0o077:
+        raise ImportValidationError("receipt permissions must be 0600 or stricter")
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ImportValidationError("receipt is not valid JSON") from error
+    if not isinstance(receipt, dict) or receipt.get("version") != 1:
+        raise ImportValidationError("receipt has an unsupported version")
+    if not isinstance(receipt.get("plan_digest"), str) or not re.fullmatch(
+        r"[0-9a-f]{64}", receipt["plan_digest"]
+    ):
+        raise ImportValidationError("receipt has an invalid plan digest")
+    entries = receipt.get("items")
+    if not isinstance(entries, list):
+        raise ImportValidationError("receipt must contain an items list")
+    for entry in entries:
+        if not isinstance(entry, dict) or not all(
+            isinstance(entry.get(key), str) and entry[key]
+            for key in ("organization", "name", "id", "status")
+        ):
+            raise ImportValidationError("receipt contains an invalid item")
+        if entry["status"] not in {"created", "deleted"}:
+            raise ImportValidationError("receipt contains an invalid item status")
+    return receipt
+
+
+def _write_receipt(path: Path, receipt: dict) -> None:
+    # The receipt is structural by contract: never add values or command output.
+    content = json.dumps(receipt, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    write_output(path, content, mode=0o600, force=True)
 
 
 class VaultImportWriter:
@@ -483,7 +578,12 @@ class VaultImportWriter:
             raise ImportValidationError(f"expected exactly one {kind}: {name}")
         return matches[0]
 
-    def _preflight(self, plan: FallbackImportPlan, collections: Mapping[str, str]) -> dict[str, tuple[str, str]]:
+    def _preflight(
+        self,
+        plan: FallbackImportPlan,
+        collections: Mapping[str, str],
+        completed: Mapping[tuple[str, str], str] | None = None,
+    ) -> dict[str, tuple[str, str]]:
         self._prepare()
         organizations = _json_list(self._run(["list", "organizations"]), "list organizations")
         all_items = _json_list(self._run(["list", "items"]), "list items")
@@ -501,12 +601,27 @@ class VaultImportWriter:
             )
             targets[organization] = (organization_id, collection_id)
 
+        completed = completed or {}
+        for key, identifier in completed.items():
+            organization, name = key
+            target_id = targets[organization][0]
+            if not any(
+                existing.get("organizationId") == target_id
+                and existing.get("name") == name
+                and existing.get("id") == identifier
+                for existing in all_items
+            ):
+                raise ImportValidationError("receipt item is absent from the vault")
         collisions = [
             item
             for item in plan.items
             if any(
                 existing.get("organizationId") == targets[item.organization][0]
                 and existing.get("name") == item.name
+                and (
+                    (item.organization, item.name) not in completed
+                    or existing.get("id") != completed[(item.organization, item.name)]
+                )
                 for existing in all_items
             )
         ]
@@ -514,25 +629,99 @@ class VaultImportWriter:
             raise ImportCollisionError("one or more target items already exist; refusing to overwrite")
         return targets
 
-    def apply(self, plan: FallbackImportPlan, collections: Mapping[str, str]) -> None:
-        targets = self._preflight(plan, collections)
+    def apply(
+        self,
+        plan: FallbackImportPlan,
+        collections: Mapping[str, str],
+        *,
+        receipt_path: Path | None = None,
+    ) -> None:
+        receipt = None
+        completed: dict[tuple[str, str], str] = {}
+        if receipt_path is not None and receipt_path.exists():
+            receipt = _load_receipt(receipt_path)
+            if receipt["plan_digest"] != plan.digest:
+                raise ImportValidationError("receipt does not match the fallback plan")
+            for entry in receipt["items"]:
+                if entry["status"] == "created":
+                    completed[(entry["organization"], entry["name"])] = entry["id"]
+            planned_keys = {(item.organization, item.name) for item in plan.items}
+            receipt_keys = {(entry["organization"], entry["name"]) for entry in receipt["items"]}
+            if not receipt_keys.issubset(planned_keys):
+                raise ImportValidationError("receipt contains an item outside the fallback plan")
+            if len(receipt_keys) != len(receipt["items"]):
+                raise ImportValidationError("receipt contains a duplicate item")
+        targets = self._preflight(plan, collections, completed)
+        if receipt is None and receipt_path is not None:
+            receipt = {"version": 1, "plan_digest": plan.digest, "items": []}
+            _write_receipt(receipt_path, receipt)
+        pending = [
+            planned
+            for planned in plan.items
+            if (planned.organization, planned.name) not in completed
+        ]
+        if not pending:
+            return
         try:
             item_template = json.loads(self._run(["get", "template", "item"]))
         except json.JSONDecodeError as error:
             raise BWEnvError("Bitwarden returned an invalid item template") from error
         if not isinstance(item_template, dict):
             raise BWEnvError("Bitwarden returned an invalid item template")
-        for planned in plan.items:
+        for planned in pending:
             organization_id, collection_id = targets[planned.organization]
             item = copy.deepcopy(item_template)
             item["name"] = planned.name
             item["organizationId"] = organization_id
             item["collectionIds"] = [collection_id]
+            item["login"] = item.get("login") if isinstance(item.get("login"), dict) else {}
+            item["login"]["uris"] = [
+                {"match": "exact", "uri": uri} for uri in planned.source_uris
+            ]
             item["fields"] = [
                 {"name": field.name, "value": field.value, "type": 0} for field in planned.fields
             ]
             encoded = self._run(["encode"], json.dumps(item, separators=(",", ":")))
-            self._run(["create", "item"], encoded)
+            created_output = self._run(["create", "item"], encoded)
+            try:
+                created = json.loads(created_output)
+            except json.JSONDecodeError as error:
+                raise BWEnvError("Bitwarden returned invalid created-item JSON") from error
+            created_id = created.get("id") if isinstance(created, dict) else None
+            if not isinstance(created_id, str) or not created_id:
+                raise BWEnvError("Bitwarden did not return a created-item identifier")
+            if receipt is not None:
+                receipt["items"].append(
+                    {
+                        "organization": planned.organization,
+                        "name": planned.name,
+                        "id": created_id,
+                        "status": "created",
+                    }
+                )
+                _write_receipt(receipt_path, receipt)
+
+    def rollback(self, receipt_path: Path) -> None:
+        receipt = _load_receipt(receipt_path)
+        self._prepare()
+        for entry in reversed(receipt["items"]):
+            if entry["status"] == "deleted":
+                continue
+            try:
+                self._run(["delete", "item", entry["id"]])
+            except BWEnvError:
+                # A previous rollback may have completed the delete before losing its receipt update.
+                current = _json_list(self._run(["list", "items"]), "list items")
+                if any(item.get("id") == entry["id"] for item in current):
+                    raise
+            entry["status"] = "deleted"
+            _write_receipt(receipt_path, receipt)
+        current = _json_list(self._run(["list", "items"]), "list items")
+        remaining = {entry["id"] for entry in receipt["items"] if entry["status"] == "deleted"} & {
+            item.get("id") for item in current
+        }
+        if remaining:
+            raise BWEnvError("rollback could not verify item removal")
 
 
 def parse_collection_mapping(value: str) -> tuple[str, str]:
@@ -607,7 +796,9 @@ def _unlock_session() -> str:
 
 
 def _resolver_from_args(args: argparse.Namespace) -> VaultResolver:
-    session = KeychainSessionStore(args.keychain_service).get() if args.keychain_service else None
+    session = os.environ.get(KEYCHAIN_ACCOUNT)
+    if not session and args.keychain_service:
+        session = KeychainSessionStore(args.keychain_service).get()
     return VaultResolver(session=session, sync=not args.no_sync)
 
 
@@ -618,11 +809,13 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bwenv")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     _add_common_arguments(parser)
     commands = parser.add_subparsers(dest="command", required=True)
     read = commands.add_parser("read", help="write one secret value to stdout")
     read.add_argument("uri")
     run = commands.add_parser("run", help="run a command with resolved environment variables")
+    run.add_argument("--env-file", type=Path)
     run.add_argument("command_args", nargs=argparse.REMAINDER)
     inject = commands.add_parser("inject", help="inject op:// references into a template")
     inject.add_argument("-i", "--in-file", type=Path)
@@ -633,8 +826,11 @@ def build_parser() -> argparse.ArgumentParser:
         "import-1password-fallback",
         help="dry-run or import a 0600 1Password fallback export without printing values",
     )
-    fallback_import.add_argument("--file", required=True, type=Path)
+    fallback_import.add_argument("--file", type=Path)
     fallback_import.add_argument("--apply", action="store_true")
+    fallback_import.add_argument("--plan-digest", help="exact digest printed by the dry-run")
+    fallback_import.add_argument("--receipt", type=Path, help="0600 receipt for resume and rollback")
+    fallback_import.add_argument("--rollback", action="store_true", help="rollback items from --receipt")
     fallback_import.add_argument(
         "--collection",
         action="append",
@@ -648,6 +844,8 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("set-session", "delete-session", "status"):
         command = keychain_commands.add_parser(name)
         command.add_argument("--service", required=True)
+    rollback = commands.add_parser("rollback", help="delete only items recorded in an import receipt")
+    rollback.add_argument("--receipt", required=True, type=Path)
     return parser
 
 
@@ -664,27 +862,54 @@ def main(argv: Sequence[str] | None = None) -> int:
                 store.get()
             return 0
         if args.command == "import-1password-fallback":
+            if args.rollback:
+                if args.apply or not args.receipt or not args.keychain_service:
+                    raise ImportValidationError(
+                        "--rollback requires --receipt and --keychain-service, without --apply"
+                    )
+                session = KeychainSessionStore(args.keychain_service).get()
+                VaultImportWriter(session, sync=not args.no_sync).rollback(args.receipt)
+                print("bwenv: rollback verified")
+                return 0
+            if args.file is None:
+                raise ImportValidationError("--file is required for fallback import")
             plan = load_fallback_import_plan(args.file)
             if not args.apply:
                 sys.stdout.write(render_fallback_import_dry_run(plan))
                 return 0
-            if not args.keychain_service:
-                raise ImportValidationError("--apply requires --keychain-service before the command")
+            if not args.keychain_service or not args.receipt or not args.plan_digest:
+                raise ImportValidationError(
+                    "--apply requires --keychain-service, --receipt and --plan-digest"
+                )
+            if args.plan_digest != plan.digest:
+                raise ImportValidationError("plan digest does not match the fallback file")
             collection_mappings = dict(args.collection)
             imported_organizations = {item.organization for item in plan.items}
             if len(collection_mappings) != len(args.collection) or set(collection_mappings) != imported_organizations:
                 raise ImportValidationError("--apply requires one unique --collection mapping per organization")
             session = KeychainSessionStore(args.keychain_service).get()
-            VaultImportWriter(session, sync=not args.no_sync).apply(plan, collection_mappings)
+            VaultImportWriter(session, sync=not args.no_sync).apply(
+                plan, collection_mappings, receipt_path=args.receipt
+            )
             print(f"bwenv: imported {plan.reference_count} references into {len(plan.items)} new items")
+            return 0
+        if args.command == "rollback":
+            if not args.keychain_service:
+                raise ImportValidationError("--rollback requires --keychain-service before the command")
+            session = KeychainSessionStore(args.keychain_service).get()
+            VaultImportWriter(session, sync=not args.no_sync).rollback(args.receipt)
+            print("bwenv: rollback verified")
             return 0
         resolver = _resolver_from_args(args)
         if args.command == "read":
             print(resolver.resolve(args.uri))
             return 0
         if args.command == "run":
+            environment = dict(os.environ)
+            if args.env_file is not None:
+                environment.update(parse_env_file(args.env_file))
             command_args = args.command_args[1:] if args.command_args[:1] == ["--"] else args.command_args
-            return run_command(command_args, os.environ, resolver)
+            return run_command(command_args, environment, resolver)
         if args.command == "inject":
             content = args.in_file.read_text(encoding="utf-8") if args.in_file else sys.stdin.read()
             rendered = render_template(content, resolver)

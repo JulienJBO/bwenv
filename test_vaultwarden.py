@@ -102,6 +102,38 @@ class VaultResolverTests(unittest.TestCase):
             "custom-token", self.resolver().resolve("bw://Infra/service/token")
         )
 
+    def test_missing_bw_fails_without_raw_process_details(self):
+        with patch.object(bwenv.subprocess, "run", side_effect=FileNotFoundError):
+            with self.assertRaisesRegex(bwenv.BWEnvError, "was not found") as raised:
+                bwenv.VaultResolver(runner=bwenv._default_bw_runner, sync=False).resolve(
+                    "op://Infra/service/token"
+                )
+        self.assertNotIn("FileNotFoundError", str(raised.exception))
+
+    def test_bw_stderr_is_not_relayed_in_diagnostics(self):
+        result = type("Result", (), {"returncode": 23, "stdout": "", "stderr": "RAW_VALUE"})()
+        with patch.object(bwenv.subprocess, "run", return_value=result):
+            with self.assertRaises(bwenv.BWEnvError) as raised:
+                bwenv._default_bw_runner(["status"], {})
+        self.assertNotIn("RAW_VALUE", str(raised.exception))
+
+    def test_locked_session_and_sync_failure_fail_closed(self):
+        def locked(args, env):
+            return '{"status":"locked"}' if args == ["status"] else ""
+
+        with self.assertRaisesRegex(bwenv.BWEnvError, "not unlocked"):
+            bwenv.VaultResolver(runner=locked, sync=False).resolve("op://Infra/service/token")
+
+        def sync_failure(args, env):
+            if args == ["status"]:
+                return '{"status":"unlocked"}'
+            if args == ["sync"]:
+                raise bwenv.BWEnvError("Bitwarden command failed: sync")
+            raise AssertionError(args)
+
+        with self.assertRaisesRegex(bwenv.BWEnvError, "sync"):
+            bwenv.VaultResolver(runner=sync_failure, sync=True).resolve("op://Infra/service/token")
+
 
 class InjectTests(unittest.TestCase):
     def setUp(self):
@@ -188,6 +220,47 @@ class InjectTests(unittest.TestCase):
             self.assertEqual(0, bwenv.main(["run", "--", "example-service", "--flag"]))
         self.assertEqual(["example-service", "--flag"], list(run_command.call_args.args[0]))
 
+    def test_env_file_accepts_comments_quotes_and_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text(
+                "# non-secret configuration\nTOKEN=op://Infra/service/token\n"
+                "PLAIN=\"plain-value\"\nexport FLAG='enabled'\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                {"TOKEN": "op://Infra/service/token", "PLAIN": "plain-value", "FLAG": "enabled"},
+                bwenv.parse_env_file(path),
+            )
+
+    def test_env_file_rejects_invalid_syntax_without_echoing_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text("NOT_VALID\n", encoding="utf-8")
+            with self.assertRaisesRegex(bwenv.BWEnvError, "line 1"):
+                bwenv.parse_env_file(path)
+
+    def test_run_env_file_overrides_parent_and_removes_session(self):
+        received = {}
+
+        def run_stub(command, environment, resolver):
+            received["command"] = command
+            received["environment"] = environment
+            return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text("TOKEN=op://Infra/service/token\nPLAIN=from-file\n", encoding="utf-8")
+            with patch.object(bwenv, "_resolver_from_args", return_value=self.resolver), patch.object(
+                bwenv, "run_command", side_effect=run_stub
+            ):
+                self.assertEqual(
+                    0,
+                    bwenv.main(["run", "--env-file", str(path), "--", "service"]),
+                )
+        self.assertEqual("op://Infra/service/token", received["environment"]["TOKEN"])
+        self.assertEqual("from-file", received["environment"]["PLAIN"])
+
 
 class KeychainTests(unittest.TestCase):
     def test_keychain_session_is_read_without_echoing_its_value(self):
@@ -211,6 +284,13 @@ class KeychainTests(unittest.TestCase):
         _, kwargs = mocked_run.call_args
         self.assertEqual(subprocess.PIPE, kwargs["stdout"])
         self.assertNotIn("capture_output", kwargs)
+
+    def test_missing_keychain_entry_is_safe(self):
+        def missing(_args):
+            raise bwenv.KeychainError("macOS Keychain operation failed")
+
+        with self.assertRaisesRegex(bwenv.KeychainError, "Keychain operation failed"):
+            bwenv.KeychainSessionStore("missing", runner=missing).get()
 
 
 class ProcessIntegrationTests(unittest.TestCase):
@@ -248,6 +328,23 @@ class ProcessIntegrationTests(unittest.TestCase):
             self.assertNotIn("SENTINEL_SECRET_FROM_BW_STDERR", result.stderr)
 
 
+class InstallerTests(unittest.TestCase):
+    def test_installer_publishes_only_explicit_bwenv_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bin_dir = Path(directory) / "bin"
+            result = subprocess.run(
+                ["sh", str(Path(__file__).parent / "scripts" / "install-bwenv.sh")],
+                env=dict(os.environ, BWENV_BIN_DIR=str(bin_dir)),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertTrue((bin_dir / "bwenv").is_symlink())
+            self.assertEqual(str(Path(bwenv.__file__)), str((bin_dir / "bwenv").resolve()))
+            self.assertFalse((bin_dir / "op").exists())
+
+
 class FallbackImportTests(unittest.TestCase):
     def fallback_file(self, directory, mode=0o600):
         source = Path(directory) / "fallback.json"
@@ -274,6 +371,49 @@ class FallbackImportTests(unittest.TestCase):
         self.assertEqual(1, plan.skipped_non_op_count)
         self.assertEqual(2, len(plan.items))
         self.assertEqual(["token", "username"], [field.name for field in plan.items[0].fields])
+        self.assertEqual(
+            [
+                "op://Infra/service",
+                "op://Infra/service/token",
+                "op://Infra/service/username",
+            ],
+            list(plan.items[0].source_uris),
+        )
+
+    def test_dry_run_prints_only_structural_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = self.fallback_file(directory)
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(0, bwenv.main(["import-1password-fallback", "--file", str(source)]))
+            plan = bwenv.load_fallback_import_plan(source)
+        self.assertIn(f"plan digest: {plan.digest}", output.getvalue())
+        self.assertNotIn("DO_NOT_PRINT", output.getvalue())
+
+    def test_apply_requires_the_exact_dry_run_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = self.fallback_file(directory)
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                self.assertEqual(
+                    1,
+                    bwenv.main(
+                        [
+                            "--keychain-service",
+                            "test-service",
+                            "import-1password-fallback",
+                            "--file",
+                            str(source),
+                            "--apply",
+                            "--plan-digest",
+                            "0" * 64,
+                            "--receipt",
+                            str(Path(directory) / "receipt"),
+                        ]
+                    ),
+                )
+        self.assertIn("plan digest", stderr.getvalue())
+        self.assertNotIn("DO_NOT_PRINT", stderr.getvalue())
 
     def test_dry_run_never_prints_fallback_values(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -354,6 +494,134 @@ class FallbackImportTests(unittest.TestCase):
         with self.assertRaises(bwenv.ImportCollisionError):
             writer.apply(plan, {"Infra": "Deployments", "Personal Ops": "Deployments"})
         self.assertNotIn(["create", "item"], calls)
+
+    def test_partial_apply_writes_receipt_and_can_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = self.fallback_file(directory)
+            plan = bwenv.load_fallback_import_plan(source)
+            receipt = Path(directory) / "import-receipt.json"
+            state = {"items": [], "create_count": 0, "fail_once": True}
+
+            def runner(args, env, input_text):
+                if args == ["status"]:
+                    return '{"status":"unlocked"}'
+                if args == ["list", "organizations"]:
+                    return bwenv.json.dumps([
+                        {"id": "infra-id", "name": "Infra"},
+                        {"id": "ops-id", "name": "Personal Ops"},
+                    ])
+                if args == ["list", "items"]:
+                    return bwenv.json.dumps(state["items"])
+                if args == ["list", "org-collections", "--organizationid", "infra-id"]:
+                    return '[{"id":"infra-collection","name":"Deployments"}]'
+                if args == ["list", "org-collections", "--organizationid", "ops-id"]:
+                    return '[{"id":"ops-collection","name":"Deployments"}]'
+                if args == ["get", "template", "item"]:
+                    return '{"type":1,"name":null,"fields":null,"login":null}'
+                if args == ["encode"]:
+                    return input_text
+                if args == ["create", "item"]:
+                    state["create_count"] += 1
+                    if state["fail_once"] and state["create_count"] == 2:
+                        state["fail_once"] = False
+                        raise bwenv.BWEnvError("Bitwarden command failed: create item")
+                    created_id = f"created-{state['create_count']}"
+                    payload = bwenv.json.loads(input_text)
+                    state["items"].append({
+                        "id": created_id,
+                        "organizationId": payload["organizationId"],
+                        "name": payload["name"],
+                    })
+                    return bwenv.json.dumps({"id": created_id})
+                raise AssertionError(f"unexpected bw call: {args}")
+
+            writer = bwenv.VaultImportWriter("session-sentinel", sync=False, runner=runner)
+            with self.assertRaises(bwenv.BWEnvError):
+                writer.apply(
+                    plan,
+                    {"Infra": "Deployments", "Personal Ops": "Deployments"},
+                    receipt_path=receipt,
+                )
+            self.assertEqual(0o600, stat.S_IMODE(receipt.stat().st_mode))
+            saved = bwenv.json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual(["service"], [entry["name"] for entry in saved["items"]])
+
+            writer.apply(
+                plan,
+                {"Infra": "Deployments", "Personal Ops": "Deployments"},
+                receipt_path=receipt,
+            )
+            saved = bwenv.json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual(2, len(saved["items"]))
+
+    def test_apply_persists_compatibility_source_uris(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = bwenv.load_fallback_import_plan(self.fallback_file(directory))
+            encoded = []
+
+            def runner(args, env, input_text):
+                if args == ["status"]:
+                    return '{"status":"unlocked"}'
+                if args == ["list", "organizations"]:
+                    return '[{"id":"infra-id","name":"Infra"},{"id":"ops-id","name":"Personal Ops"}]'
+                if args == ["list", "items"]:
+                    return "[]"
+                if args == ["list", "org-collections", "--organizationid", "infra-id"]:
+                    return '[{"id":"infra-collection","name":"Deployments"}]'
+                if args == ["list", "org-collections", "--organizationid", "ops-id"]:
+                    return '[{"id":"ops-collection","name":"Deployments"}]'
+                if args == ["get", "template", "item"]:
+                    return '{"type":1,"name":null,"fields":null,"login":null}'
+                if args == ["encode"]:
+                    encoded.append(bwenv.json.loads(input_text))
+                    return "encoded"
+                if args == ["create", "item"]:
+                    return '{"id":"created"}'
+                raise AssertionError(f"unexpected bw call: {args}")
+
+            bwenv.VaultImportWriter("session-sentinel", sync=False, runner=runner).apply(
+                plan, {"Infra": "Deployments", "Personal Ops": "Deployments"}
+            )
+        self.assertEqual(
+            [
+                "op://Infra/service",
+                "op://Infra/service/token",
+                "op://Infra/service/username",
+            ],
+            [uri["uri"] for uri in encoded[0]["login"]["uris"]],
+        )
+
+    def test_rollback_is_idempotent_and_verifies_receipt_ids_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = Path(directory) / "receipt.json"
+            receipt.write_text(
+                '{"version":1,"plan_digest":"' + "0" * 64 + '","items":['
+                '{"organization":"Infra","name":"service","id":"created-1","status":"created"}]}',
+                encoding="utf-8",
+            )
+            receipt.chmod(0o600)
+            state = {"items": [{"id": "created-1", "organizationId": "infra-id", "name": "service"}]}
+            deleted = []
+
+            def runner(args, env, input_text):
+                if args == ["status"]:
+                    return '{"status":"unlocked"}'
+                if args == ["list", "items"]:
+                    return bwenv.json.dumps(state["items"])
+                if args[:2] == ["delete", "item"]:
+                    identifier = args[2]
+                    deleted.append(identifier)
+                    state["items"] = [item for item in state["items"] if item["id"] != identifier]
+                    return ""
+                raise AssertionError(f"unexpected bw call: {args}")
+
+            writer = bwenv.VaultImportWriter("session-sentinel", sync=False, runner=runner)
+            writer.rollback(receipt)
+            writer.rollback(receipt)
+            self.assertEqual(["created-1"], deleted)
+            saved = bwenv.json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual("deleted", saved["items"][0]["status"])
+            self.assertEqual([], state["items"])
 
 
 if __name__ == "__main__":
