@@ -131,7 +131,9 @@ preserves the `op://organisation/item/champ` contract exactly, and stores the
 source URI in login URI metadata for renamed-item migrations. `--apply` is the
 only command that sends a fallback value to Vaultwarden. The receipt is
 structural, written atomically with mode `0600`, and lets a failed import
-resume safely with the same digest:
+resume safely with the same digest. Each pending entry also carries a
+deterministic non-secret marker, so recovery never adopts an unrelated item
+with the same name.
 
 ```sh
 bwenv --keychain-service bwenv.bitwarden-poc.kefapps.wtf rollback \

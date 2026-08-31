@@ -20,6 +20,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
+from urllib.parse import quote
 
 
 VERSION = "2.0.0"
@@ -114,6 +115,14 @@ class FallbackImportPlan:
             sort_keys=True,
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+
+def import_marker(plan_digest: str, organization: str, item_name: str) -> str:
+    """Build a deterministic, non-secret identity for one planned item."""
+    return (
+        f"bwenv-import://{plan_digest}/"
+        f"{quote(organization, safe='')}/{quote(item_name, safe='')}"
+    )
 
 
 class URIParser:
@@ -527,6 +536,13 @@ def _load_receipt(path: Path) -> dict:
             raise ImportValidationError("receipt contains an invalid item status")
         if entry["status"] == "created" and not entry["id"]:
             raise ImportValidationError("receipt contains an invalid created item")
+        marker = entry.get("marker")
+        if marker is not None and (
+            not isinstance(marker, str) or not marker.startswith("bwenv-import://")
+        ):
+            raise ImportValidationError("receipt contains an invalid item marker")
+        if entry["status"] == "creating" and not marker:
+            raise ImportValidationError("pending receipt item has no marker")
     return receipt
 
 
@@ -534,6 +550,14 @@ def _write_receipt(path: Path, receipt: dict) -> None:
     # The receipt is structural by contract: never add values or command output.
     content = json.dumps(receipt, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
     write_output(path, content, mode=0o600, force=True)
+
+
+def _item_has_marker(item: dict, marker: str) -> bool:
+    login = item.get("login") if isinstance(item.get("login"), dict) else {}
+    return any(
+        isinstance(uri, dict) and uri.get("uri") == marker
+        for uri in login.get("uris", []) or []
+    )
 
 
 class VaultImportWriter:
@@ -585,7 +609,8 @@ class VaultImportWriter:
         plan: FallbackImportPlan,
         collections: Mapping[str, str],
         completed: Mapping[tuple[str, str], str] | None = None,
-        creating: dict[tuple[str, str], str | None] | None = None,
+        creating: Mapping[tuple[str, str], str] | None = None,
+        adopted: dict[tuple[str, str], str] | None = None,
     ) -> dict[str, tuple[str, str]]:
         self._prepare()
         organizations = _json_list(self._run(["list", "organizations"]), "list organizations")
@@ -606,6 +631,7 @@ class VaultImportWriter:
 
         completed = completed or {}
         creating = creating or {}
+        adopted = adopted if adopted is not None else {}
         for key, identifier in completed.items():
             organization, name = key
             target_id = targets[organization][0]
@@ -619,18 +645,24 @@ class VaultImportWriter:
         for key in creating:
             organization, name = key
             target_id = targets[organization][0]
-            candidates = [
+            named_candidates = [
                 existing
                 for existing in all_items
                 if existing.get("organizationId") == target_id and existing.get("name") == name
             ]
-            if len(candidates) > 1:
+            marker = creating[key]
+            marked_candidates = [
+                candidate for candidate in named_candidates if _item_has_marker(candidate, marker)
+            ]
+            if len(named_candidates) > 1 or len(marked_candidates) > 1:
                 raise ImportCollisionError("multiple candidates found for a pending receipt item")
-            if candidates:
-                identifier = candidates[0].get("id")
+            if named_candidates and not marked_candidates:
+                raise ImportCollisionError("pending receipt candidate has no matching marker")
+            if marked_candidates:
+                identifier = marked_candidates[0].get("id")
                 if not isinstance(identifier, str) or not identifier:
                     raise ImportValidationError("pending receipt candidate has no identifier")
-                creating[key] = identifier
+                adopted[key] = identifier
         collisions = [
             item
             for item in plan.items
@@ -663,7 +695,8 @@ class VaultImportWriter:
     ) -> None:
         receipt = None
         completed: dict[tuple[str, str], str] = {}
-        creating: dict[tuple[str, str], str | None] = {}
+        creating: dict[tuple[str, str], str] = {}
+        adopted: dict[tuple[str, str], str] = {}
         if receipt_path is not None and receipt_path.exists():
             receipt = _load_receipt(receipt_path)
             if receipt["plan_digest"] != plan.digest:
@@ -672,20 +705,26 @@ class VaultImportWriter:
                 if entry["status"] == "created":
                     completed[(entry["organization"], entry["name"])] = entry["id"]
                 elif entry["status"] == "creating":
-                    creating[(entry["organization"], entry["name"])] = entry["id"] or None
+                    creating[(entry["organization"], entry["name"])] = entry["marker"]
             planned_keys = {(item.organization, item.name) for item in plan.items}
             receipt_keys = {(entry["organization"], entry["name"]) for entry in receipt["items"]}
             if not receipt_keys.issubset(planned_keys):
                 raise ImportValidationError("receipt contains an item outside the fallback plan")
             if len(receipt_keys) != len(receipt["items"]):
                 raise ImportValidationError("receipt contains a duplicate item")
-        targets = self._preflight(plan, collections, completed, creating)
+            for entry in receipt["items"]:
+                expected_marker = import_marker(
+                    plan.digest, entry["organization"], entry["name"]
+                )
+                if entry.get("marker") not in (None, expected_marker):
+                    raise ImportValidationError("receipt item marker does not match the plan")
+        targets = self._preflight(plan, collections, completed, creating, adopted)
         if receipt is None and receipt_path is not None:
             receipt = {"version": 1, "plan_digest": plan.digest, "items": []}
             _write_receipt(receipt_path, receipt)
         for entry in receipt["items"] if receipt is not None else []:
             key = (entry["organization"], entry["name"])
-            identifier = creating.get(key)
+            identifier = adopted.get(key)
             if entry["status"] == "creating" and identifier:
                 entry["id"] = identifier
                 entry["status"] = "created"
@@ -722,6 +761,9 @@ class VaultImportWriter:
                         "name": planned.name,
                         "id": "",
                         "status": "creating",
+                        "marker": import_marker(
+                            plan.digest, planned.organization, planned.name
+                        ),
                     }
                     receipt["items"].append(receipt_entry)
                 _write_receipt(receipt_path, receipt)
@@ -733,6 +775,12 @@ class VaultImportWriter:
             item["login"]["uris"] = [
                 {"match": "exact", "uri": uri} for uri in planned.source_uris
             ]
+            marker = (
+                receipt_entry["marker"]
+                if receipt_entry is not None
+                else import_marker(plan.digest, planned.organization, planned.name)
+            )
+            item["login"]["uris"].append({"match": "exact", "uri": marker})
             item["fields"] = [
                 {"name": field.name, "value": field.value, "type": 0} for field in planned.fields
             ]
@@ -752,6 +800,11 @@ class VaultImportWriter:
 
     def rollback(self, receipt_path: Path) -> None:
         receipt = _load_receipt(receipt_path)
+        for entry in receipt["items"]:
+            if entry.get("marker") is not None and entry["marker"] != import_marker(
+                receipt["plan_digest"], entry["organization"], entry["name"]
+            ):
+                raise ImportValidationError("receipt item marker does not match the plan")
         self._prepare()
         pending = [entry for entry in receipt["items"] if entry["status"] == "creating"]
         if pending:
@@ -768,10 +821,16 @@ class VaultImportWriter:
                     if item.get("organizationId") == matches[0]["id"]
                     and item.get("name") == entry["name"]
                 ]
-                if len(candidates) > 1:
+                marked_candidates = [
+                    item for item in candidates
+                    if _item_has_marker(item, entry["marker"])
+                ]
+                if len(candidates) > 1 or len(marked_candidates) > 1:
                     raise ImportCollisionError("multiple candidates found for a pending receipt item")
-                if candidates:
-                    identifier = candidates[0].get("id")
+                if candidates and not marked_candidates:
+                    raise ImportCollisionError("pending receipt candidate has no matching marker")
+                if marked_candidates:
+                    identifier = marked_candidates[0].get("id")
                     if not isinstance(identifier, str) or not identifier:
                         raise ImportValidationError("pending receipt candidate has no identifier")
                     entry["id"] = identifier

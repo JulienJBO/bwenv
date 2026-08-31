@@ -619,6 +619,7 @@ class FallbackImportTests(unittest.TestCase):
                         "id": "created-after-invalid-response",
                         "organizationId": payload["organizationId"],
                         "name": payload["name"],
+                        "login": payload["login"],
                     })
                     if state["invalid_once"]:
                         state["invalid_once"] = False
@@ -651,6 +652,65 @@ class FallbackImportTests(unittest.TestCase):
             self.assertEqual(["created-after-invalid-response"], state["deletes"])
             self.assertEqual([], state["items"])
 
+    def test_unmarked_concurrent_item_is_never_adopted_or_deleted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "fallback.json"
+            source.write_text(
+                '{"secrets":{"op://Infra/service/token":{"value":"[REDACTED:token]"}}}',
+                encoding="utf-8",
+            )
+            source.chmod(0o600)
+            plan = bwenv.load_fallback_import_plan(source)
+            receipt = Path(directory) / "receipt.json"
+            marker = bwenv.import_marker(plan.digest, "Infra", "service")
+            receipt.write_text(
+                bwenv.json.dumps({
+                    "version": 1,
+                    "plan_digest": plan.digest,
+                    "items": [{
+                        "organization": "Infra",
+                        "name": "service",
+                        "id": "",
+                        "status": "creating",
+                        "marker": marker,
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            receipt.chmod(0o600)
+            calls = []
+
+            def runner(args, env, input_text):
+                calls.append(args)
+                if args == ["status"]:
+                    return '{"status":"unlocked"}'
+                if args == ["list", "organizations"]:
+                    return '[{"id":"infra-id","name":"Infra"}]'
+                if args == ["list", "items"]:
+                    return '[{"id":"operator-created","organizationId":"infra-id","name":"service","login":{"uris":[]}}]'
+                if args == ["list", "org-collections", "--organizationid", "infra-id"]:
+                    return '[{"id":"infra-collection","name":"Deployments"}]'
+                raise AssertionError(args)
+
+            writer = bwenv.VaultImportWriter("session-sentinel", sync=False, runner=runner)
+            with self.assertRaises(bwenv.ImportCollisionError):
+                writer.apply(plan, {"Infra": "Deployments"}, receipt_path=receipt)
+            with self.assertRaises(bwenv.ImportCollisionError):
+                writer.rollback(receipt)
+            self.assertNotIn(["delete", "item", "operator-created"], calls)
+
+    def test_pending_receipt_without_marker_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = Path(directory) / "receipt.json"
+            receipt.write_text(
+                '{"version":1,"plan_digest":"' + "0" * 64 + '","items":['
+                '{"organization":"Infra","name":"service","id":"","status":"creating"}]}',
+                encoding="utf-8",
+            )
+            receipt.chmod(0o600)
+            with self.assertRaisesRegex(bwenv.ImportValidationError, "no marker"):
+                bwenv._load_receipt(receipt)
+
     def test_apply_persists_compatibility_source_uris(self):
         with tempfile.TemporaryDirectory() as directory:
             plan = bwenv.load_fallback_import_plan(self.fallback_file(directory))
@@ -679,14 +739,15 @@ class FallbackImportTests(unittest.TestCase):
             bwenv.VaultImportWriter("session-sentinel", sync=False, runner=runner).apply(
                 plan, {"Infra": "Deployments", "Personal Ops": "Deployments"}
             )
-        self.assertEqual(
-            [
-                "op://Infra/service",
-                "op://Infra/service/token",
-                "op://Infra/service/username",
-            ],
-            [uri["uri"] for uri in encoded[0]["login"]["uris"]],
-        )
+            self.assertEqual(
+                [
+                    "op://Infra/service",
+                    "op://Infra/service/token",
+                    "op://Infra/service/username",
+                    bwenv.import_marker(plan.digest, "Infra", "service"),
+                ],
+                [uri["uri"] for uri in encoded[0]["login"]["uris"]],
+            )
 
     def test_rollback_is_idempotent_and_verifies_receipt_ids_only(self):
         with tempfile.TemporaryDirectory() as directory:
