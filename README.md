@@ -23,8 +23,9 @@ Install the explicit `bwenv` command:
 ./scripts/install-bwenv.sh
 ```
 
-The installer creates only `~/.local/bin/bwenv` (or `BWENV_BIN_DIR`) and never
-replaces, aliases, or intercepts the official `op` command.
+The installer creates an atomic standalone copy at `~/.local/bin/bwenv` (or
+`BWENV_BIN_DIR`) and never replaces, aliases, or intercepts the official `op`
+command. Reinstallation replaces only a previously marked `bwenv` copy.
 
 The CLI must be unlocked whenever `bwenv` resolves a reference. For a
 LaunchAgent, save the resulting session in the logged-in user's macOS

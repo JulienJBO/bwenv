@@ -520,11 +520,13 @@ def _load_receipt(path: Path) -> dict:
     for entry in entries:
         if not isinstance(entry, dict) or not all(
             isinstance(entry.get(key), str) and entry[key]
-            for key in ("organization", "name", "id", "status")
-        ):
+            for key in ("organization", "name", "status")
+        ) or not isinstance(entry.get("id"), str):
             raise ImportValidationError("receipt contains an invalid item")
-        if entry["status"] not in {"created", "deleted"}:
+        if entry["status"] not in {"creating", "created", "deleted"}:
             raise ImportValidationError("receipt contains an invalid item status")
+        if entry["status"] == "created" and not entry["id"]:
+            raise ImportValidationError("receipt contains an invalid created item")
     return receipt
 
 
@@ -583,6 +585,7 @@ class VaultImportWriter:
         plan: FallbackImportPlan,
         collections: Mapping[str, str],
         completed: Mapping[tuple[str, str], str] | None = None,
+        creating: dict[tuple[str, str], str | None] | None = None,
     ) -> dict[str, tuple[str, str]]:
         self._prepare()
         organizations = _json_list(self._run(["list", "organizations"]), "list organizations")
@@ -602,6 +605,7 @@ class VaultImportWriter:
             targets[organization] = (organization_id, collection_id)
 
         completed = completed or {}
+        creating = creating or {}
         for key, identifier in completed.items():
             organization, name = key
             target_id = targets[organization][0]
@@ -612,6 +616,21 @@ class VaultImportWriter:
                 for existing in all_items
             ):
                 raise ImportValidationError("receipt item is absent from the vault")
+        for key in creating:
+            organization, name = key
+            target_id = targets[organization][0]
+            candidates = [
+                existing
+                for existing in all_items
+                if existing.get("organizationId") == target_id and existing.get("name") == name
+            ]
+            if len(candidates) > 1:
+                raise ImportCollisionError("multiple candidates found for a pending receipt item")
+            if candidates:
+                identifier = candidates[0].get("id")
+                if not isinstance(identifier, str) or not identifier:
+                    raise ImportValidationError("pending receipt candidate has no identifier")
+                creating[key] = identifier
         collisions = [
             item
             for item in plan.items
@@ -619,8 +638,14 @@ class VaultImportWriter:
                 existing.get("organizationId") == targets[item.organization][0]
                 and existing.get("name") == item.name
                 and (
-                    (item.organization, item.name) not in completed
-                    or existing.get("id") != completed[(item.organization, item.name)]
+                    (
+                        (item.organization, item.name) not in completed
+                        and (item.organization, item.name) not in creating
+                    )
+                    or (
+                        (item.organization, item.name) in completed
+                        and existing.get("id") != completed[(item.organization, item.name)]
+                    )
                 )
                 for existing in all_items
             )
@@ -638,6 +663,7 @@ class VaultImportWriter:
     ) -> None:
         receipt = None
         completed: dict[tuple[str, str], str] = {}
+        creating: dict[tuple[str, str], str | None] = {}
         if receipt_path is not None and receipt_path.exists():
             receipt = _load_receipt(receipt_path)
             if receipt["plan_digest"] != plan.digest:
@@ -645,21 +671,29 @@ class VaultImportWriter:
             for entry in receipt["items"]:
                 if entry["status"] == "created":
                     completed[(entry["organization"], entry["name"])] = entry["id"]
+                elif entry["status"] == "creating":
+                    creating[(entry["organization"], entry["name"])] = entry["id"] or None
             planned_keys = {(item.organization, item.name) for item in plan.items}
             receipt_keys = {(entry["organization"], entry["name"]) for entry in receipt["items"]}
             if not receipt_keys.issubset(planned_keys):
                 raise ImportValidationError("receipt contains an item outside the fallback plan")
             if len(receipt_keys) != len(receipt["items"]):
                 raise ImportValidationError("receipt contains a duplicate item")
-        targets = self._preflight(plan, collections, completed)
+        targets = self._preflight(plan, collections, completed, creating)
         if receipt is None and receipt_path is not None:
             receipt = {"version": 1, "plan_digest": plan.digest, "items": []}
             _write_receipt(receipt_path, receipt)
-        pending = [
-            planned
-            for planned in plan.items
-            if (planned.organization, planned.name) not in completed
-        ]
+        for entry in receipt["items"] if receipt is not None else []:
+            key = (entry["organization"], entry["name"])
+            identifier = creating.get(key)
+            if entry["status"] == "creating" and identifier:
+                entry["id"] = identifier
+                entry["status"] = "created"
+                completed[key] = identifier
+        if receipt is not None:
+            _write_receipt(receipt_path, receipt)
+        pending = [planned for planned in plan.items
+                   if (planned.organization, planned.name) not in completed]
         if not pending:
             return
         try:
@@ -670,6 +704,27 @@ class VaultImportWriter:
             raise BWEnvError("Bitwarden returned an invalid item template")
         for planned in pending:
             organization_id, collection_id = targets[planned.organization]
+            receipt_entry = None
+            if receipt is not None:
+                receipt_entry = next(
+                    (
+                        entry
+                        for entry in receipt["items"]
+                        if entry["organization"] == planned.organization
+                        and entry["name"] == planned.name
+                        and entry["status"] == "creating"
+                    ),
+                    None,
+                )
+                if receipt_entry is None:
+                    receipt_entry = {
+                        "organization": planned.organization,
+                        "name": planned.name,
+                        "id": "",
+                        "status": "creating",
+                    }
+                    receipt["items"].append(receipt_entry)
+                _write_receipt(receipt_path, receipt)
             item = copy.deepcopy(item_template)
             item["name"] = planned.name
             item["organizationId"] = organization_id
@@ -690,22 +745,45 @@ class VaultImportWriter:
             created_id = created.get("id") if isinstance(created, dict) else None
             if not isinstance(created_id, str) or not created_id:
                 raise BWEnvError("Bitwarden did not return a created-item identifier")
-            if receipt is not None:
-                receipt["items"].append(
-                    {
-                        "organization": planned.organization,
-                        "name": planned.name,
-                        "id": created_id,
-                        "status": "created",
-                    }
-                )
+            if receipt_entry is not None:
+                receipt_entry["id"] = created_id
+                receipt_entry["status"] = "created"
                 _write_receipt(receipt_path, receipt)
 
     def rollback(self, receipt_path: Path) -> None:
         receipt = _load_receipt(receipt_path)
         self._prepare()
+        pending = [entry for entry in receipt["items"] if entry["status"] == "creating"]
+        if pending:
+            organizations = _json_list(self._run(["list", "organizations"]), "list organizations")
+            all_items = _json_list(self._run(["list", "items"]), "list items")
+            for entry in pending:
+                matches = [org for org in organizations if org.get("name") == entry["organization"]]
+                if len(matches) != 1 or not isinstance(matches[0].get("id"), str):
+                    raise ImportValidationError(
+                        f"expected exactly one organization: {entry['organization']}"
+                    )
+                candidates = [
+                    item for item in all_items
+                    if item.get("organizationId") == matches[0]["id"]
+                    and item.get("name") == entry["name"]
+                ]
+                if len(candidates) > 1:
+                    raise ImportCollisionError("multiple candidates found for a pending receipt item")
+                if candidates:
+                    identifier = candidates[0].get("id")
+                    if not isinstance(identifier, str) or not identifier:
+                        raise ImportValidationError("pending receipt candidate has no identifier")
+                    entry["id"] = identifier
+                    entry["status"] = "created"
+            _write_receipt(receipt_path, receipt)
         for entry in reversed(receipt["items"]):
             if entry["status"] == "deleted":
+                continue
+            if entry["status"] == "creating":
+                # No item exists for this intent; there is nothing safe to delete.
+                entry["status"] = "deleted"
+                _write_receipt(receipt_path, receipt)
                 continue
             try:
                 self._run(["delete", "item", entry["id"]])

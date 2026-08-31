@@ -2,6 +2,7 @@
 """Contract tests for the Vaultwarden-compatible op:// resolver."""
 
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -331,18 +332,44 @@ class ProcessIntegrationTests(unittest.TestCase):
 class InstallerTests(unittest.TestCase):
     def test_installer_publishes_only_explicit_bwenv_command(self):
         with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "source"
+            scripts = root / "scripts"
+            scripts.mkdir(parents=True)
+            shutil.copy2(Path(bwenv.__file__), root / "bwenv.py")
+            installer = scripts / "install-bwenv.sh"
+            shutil.copy2(Path(__file__).parent / "scripts" / "install-bwenv.sh", installer)
+            installer.chmod(0o755)
             bin_dir = Path(directory) / "bin"
             result = subprocess.run(
-                ["sh", str(Path(__file__).parent / "scripts" / "install-bwenv.sh")],
+                ["sh", str(installer)],
                 env=dict(os.environ, BWENV_BIN_DIR=str(bin_dir)),
                 text=True,
                 capture_output=True,
                 check=False,
             )
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertTrue((bin_dir / "bwenv").is_symlink())
-            self.assertEqual(str(Path(bwenv.__file__)), str((bin_dir / "bwenv").resolve()))
+            installed = bin_dir / "bwenv"
+            self.assertFalse(installed.is_symlink())
+            self.assertEqual(0o755, stat.S_IMODE(installed.stat().st_mode))
             self.assertFalse((bin_dir / "op").exists())
+            source = root / "bwenv.py"
+            source.write_text("this source was changed after installation\n", encoding="utf-8")
+            result = subprocess.run(
+                [str(installed), "--version"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("bwenv 2.0.0\n", result.stdout)
+            source.unlink()
+            result = subprocess.run(
+                [str(installed), "--version"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
 
 
 class FallbackImportTests(unittest.TestCase):
@@ -544,7 +571,10 @@ class FallbackImportTests(unittest.TestCase):
                 )
             self.assertEqual(0o600, stat.S_IMODE(receipt.stat().st_mode))
             saved = bwenv.json.loads(receipt.read_text(encoding="utf-8"))
-            self.assertEqual(["service"], [entry["name"] for entry in saved["items"]])
+            self.assertEqual(["created", "creating"], [
+                entry["status"] for entry in saved["items"]
+            ])
+            self.assertEqual("", saved["items"][1]["id"])
 
             writer.apply(
                 plan,
@@ -553,6 +583,73 @@ class FallbackImportTests(unittest.TestCase):
             )
             saved = bwenv.json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual(2, len(saved["items"]))
+
+    def test_successful_create_with_invalid_response_is_recoverable_and_reversible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "fallback.json"
+            source.write_text(
+                bwenv.json.dumps({
+                    "secrets": {
+                        "op://Infra/service/token": {"value": "[REDACTED:token]"},
+                    }
+                }),
+                encoding="utf-8",
+            )
+            source.chmod(0o600)
+            plan = bwenv.load_fallback_import_plan(source)
+            receipt = Path(directory) / "receipt.json"
+            state = {"items": [], "invalid_once": True, "deletes": []}
+
+            def runner(args, env, input_text):
+                if args == ["status"]:
+                    return '{"status":"unlocked"}'
+                if args == ["list", "organizations"]:
+                    return '[{"id":"infra-id","name":"Infra"}]'
+                if args == ["list", "items"]:
+                    return bwenv.json.dumps(state["items"])
+                if args == ["list", "org-collections", "--organizationid", "infra-id"]:
+                    return '[{"id":"infra-collection","name":"Deployments"}]'
+                if args == ["get", "template", "item"]:
+                    return '{"type":1,"name":null,"fields":null,"login":null}'
+                if args == ["encode"]:
+                    return input_text
+                if args == ["create", "item"]:
+                    payload = bwenv.json.loads(input_text)
+                    state["items"].append({
+                        "id": "created-after-invalid-response",
+                        "organizationId": payload["organizationId"],
+                        "name": payload["name"],
+                    })
+                    if state["invalid_once"]:
+                        state["invalid_once"] = False
+                        return "not-json"
+                    return '{"id":"created-after-invalid-response"}'
+                if args[:2] == ["delete", "item"]:
+                    identifier = args[2]
+                    state["deletes"].append(identifier)
+                    state["items"] = [item for item in state["items"] if item["id"] != identifier]
+                    return ""
+                raise AssertionError(f"unexpected bw call: {args}")
+
+            writer = bwenv.VaultImportWriter("session-sentinel", sync=False, runner=runner)
+            with self.assertRaisesRegex(bwenv.BWEnvError, "invalid created-item JSON"):
+                writer.apply(
+                    plan, {"Infra": "Deployments"}, receipt_path=receipt
+                )
+            pending = bwenv.json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual("creating", pending["items"][0]["status"])
+            self.assertEqual("", pending["items"][0]["id"])
+
+            writer.apply(plan, {"Infra": "Deployments"}, receipt_path=receipt)
+            recovered = bwenv.json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual("created", recovered["items"][0]["status"])
+            self.assertEqual(["created-after-invalid-response"], [
+                item["id"] for item in state["items"]
+            ])
+
+            writer.rollback(receipt)
+            self.assertEqual(["created-after-invalid-response"], state["deletes"])
+            self.assertEqual([], state["items"])
 
     def test_apply_persists_compatibility_source_uris(self):
         with tempfile.TemporaryDirectory() as directory:
