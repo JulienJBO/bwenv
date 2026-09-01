@@ -24,6 +24,7 @@ from urllib.parse import quote
 
 
 VERSION = "2.0.0"
+URI_MATCH_EXACT = 3
 OP_URI_PATTERN = re.compile(r"^op://([^/]+)/([^/]+)/(.+)$")
 ENV_FILE_LINE_PATTERN = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 TEMPLATE_REFERENCE_PATTERN = re.compile(
@@ -773,14 +774,14 @@ class VaultImportWriter:
             item["collectionIds"] = [collection_id]
             item["login"] = item.get("login") if isinstance(item.get("login"), dict) else {}
             item["login"]["uris"] = [
-                {"match": "exact", "uri": uri} for uri in planned.source_uris
+                {"match": URI_MATCH_EXACT, "uri": uri} for uri in planned.source_uris
             ]
             marker = (
                 receipt_entry["marker"]
                 if receipt_entry is not None
                 else import_marker(plan.digest, planned.organization, planned.name)
             )
-            item["login"]["uris"].append({"match": "exact", "uri": marker})
+            item["login"]["uris"].append({"match": URI_MATCH_EXACT, "uri": marker})
             item["fields"] = [
                 {"name": field.name, "value": field.value, "type": 0} for field in planned.fields
             ]

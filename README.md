@@ -133,7 +133,8 @@ only command that sends a fallback value to Vaultwarden. The receipt is
 structural, written atomically with mode `0600`, and lets a failed import
 resume safely with the same digest. Each pending entry also carries a
 deterministic non-secret marker, so recovery never adopts an unrelated item
-with the same name.
+with the same name. Login URI match metadata uses Bitwarden's numeric `Exact`
+value (`3`), as required by `bw create item`.
 
 ```sh
 bwenv --keychain-service bwenv.bitwarden-poc.kefapps.wtf rollback \
