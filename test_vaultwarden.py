@@ -748,6 +748,10 @@ class FallbackImportTests(unittest.TestCase):
                 ],
                 [uri["uri"] for uri in encoded[0]["login"]["uris"]],
             )
+            self.assertTrue(all(
+                uri["match"] == bwenv.URI_MATCH_EXACT
+                for uri in encoded[0]["login"]["uris"]
+            ))
 
     def test_rollback_is_idempotent_and_verifies_receipt_ids_only(self):
         with tempfile.TemporaryDirectory() as directory:
