@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# bwenv managed install v1
 """Resolve Bitwarden/Vaultwarden secrets from 1Password-compatible references.
 
 The public compatibility contract is ``op://organisation/item/field``. This
@@ -890,8 +891,14 @@ def _default_security_runner(args: list[str]) -> str:
     return result.stdout
 
 
+def _linux_session_path(service: str) -> Path:
+    config_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "bwenv"
+    safe_name = "".join(c if c.isalnum() or c in ".-_" else "_" for c in service)
+    return config_dir / f"{safe_name}.session"
+
+
 class KeychainSessionStore:
-    """Small macOS Keychain adapter; it never logs stored session values."""
+    """Small macOS Keychain adapter or Linux 0600 session store; it never logs stored session values."""
 
     def __init__(self, service: str, *, runner: Callable[[list[str]], str] = _default_security_runner):
         if not service:
@@ -899,23 +906,56 @@ class KeychainSessionStore:
         self.service = service
         self.runner = runner
 
+    def _uses_security_command(self) -> bool:
+        return sys.platform == "darwin" or self.runner != _default_security_runner
+
     def get(self) -> str:
-        value = self.runner(
-            ["security", "find-generic-password", "-s", self.service, "-a", KEYCHAIN_ACCOUNT, "-w"]
-        ).strip()
+        if self._uses_security_command():
+            value = self.runner(
+                ["security", "find-generic-password", "-s", self.service, "-a", KEYCHAIN_ACCOUNT, "-w"]
+            ).strip()
+            if not value:
+                raise KeychainError("Keychain session is empty")
+            return value
+        session_file = _linux_session_path(self.service)
+        if not session_file.is_file():
+            raise KeychainError(f"session file does not exist for service {self.service}")
+        mode = stat.S_IMODE(session_file.stat().st_mode)
+        if mode & 0o077 != 0:
+            raise KeychainError(f"insecure permissions on session file: mode {oct(mode)}")
+        value = session_file.read_text(encoding="utf-8").strip()
         if not value:
-            raise KeychainError("Keychain session is empty")
+            raise KeychainError(f"session file is empty for service {self.service}")
         return value
 
     def set(self, session: str) -> None:
         if not session:
             raise KeychainError("refusing to store an empty session")
-        self.runner(["security", "add-generic-password", "-U", "-s", self.service,
-                     "-a", KEYCHAIN_ACCOUNT, "-w", session])
+        if self._uses_security_command():
+            self.runner(["security", "add-generic-password", "-U", "-s", self.service,
+                         "-a", KEYCHAIN_ACCOUNT, "-w", session])
+            return
+        session_file = _linux_session_path(self.service)
+        session_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, temp_path = tempfile.mkstemp(dir=session_file.parent, prefix=".session-", text=True)
+        try:
+            os.chmod(temp_path, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(session + "\n")
+            os.replace(temp_path, session_file)
+        except Exception:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise
 
     def delete(self) -> None:
-        self.runner(["security", "delete-generic-password", "-s", self.service,
-                     "-a", KEYCHAIN_ACCOUNT])
+        if self._uses_security_command():
+            self.runner(["security", "delete-generic-password", "-s", self.service,
+                         "-a", KEYCHAIN_ACCOUNT])
+            return
+        session_file = _linux_session_path(self.service)
+        if session_file.exists():
+            session_file.unlink()
 
 
 def _unlock_session() -> str:
@@ -935,8 +975,17 @@ def _unlock_session() -> str:
 
 def _resolver_from_args(args: argparse.Namespace) -> VaultResolver:
     session = os.environ.get(KEYCHAIN_ACCOUNT)
-    if not session and args.keychain_service:
-        session = KeychainSessionStore(args.keychain_service).get()
+    if not session:
+        service = (
+            getattr(args, "keychain_service", None)
+            or os.environ.get("BWENV_KEYCHAIN_SERVICE")
+            or "bwenv.bitwarden-poc.kefapps.wtf"
+        )
+        try:
+            session = KeychainSessionStore(service).get()
+        except KeychainError:
+            if getattr(args, "keychain_service", None):
+                raise
     return VaultResolver(session=session, sync=not args.no_sync)
 
 
