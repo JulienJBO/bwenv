@@ -293,6 +293,19 @@ class KeychainTests(unittest.TestCase):
         with self.assertRaisesRegex(bwenv.KeychainError, "Keychain operation failed"):
             bwenv.KeychainSessionStore("missing", runner=missing).get()
 
+    def test_linux_session_store_roundtrip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"XDG_CONFIG_HOME": directory}), patch("bwenv.sys.platform", "linux"):
+                store = bwenv.KeychainSessionStore("test.service")
+                with self.assertRaises(bwenv.KeychainError):
+                    store.get()
+                store.set("secret-session-token")
+                self.assertEqual("secret-session-token", store.get())
+                session_file = bwenv._linux_session_path("test.service")
+                self.assertEqual(0o600, stat.S_IMODE(session_file.stat().st_mode))
+                store.delete()
+                self.assertFalse(session_file.exists())
+
 
 class ProcessIntegrationTests(unittest.TestCase):
     def test_inject_uses_a_bw_executable_from_path(self):
