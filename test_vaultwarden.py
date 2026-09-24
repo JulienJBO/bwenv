@@ -156,6 +156,18 @@ class VaultResolverTests(unittest.TestCase):
                 bwenv._default_bw_runner(["status"], {})
         self.assertNotIn("RAW_VALUE", str(raised.exception))
 
+    def test_status_nonzero_with_valid_json_is_still_returned_for_classification(self):
+        result = type(
+            "Result",
+            (),
+            {"returncode": 1, "stdout": '{"status":"locked"}\n', "stderr": "RAW_VALUE"},
+        )()
+        with patch.object(bwenv.subprocess, "run", return_value=result):
+            self.assertEqual(
+                '{"status":"locked"}\n',
+                bwenv._default_bw_runner(["status"], {"BW_SESSION": "session-sentinel"}),
+            )
+
     def test_locked_session_and_sync_failure_fail_closed(self):
         def locked(args, env):
             return '{"status":"locked"}' if args == ["status"] else ""
@@ -172,6 +184,35 @@ class VaultResolverTests(unittest.TestCase):
 
         with self.assertRaisesRegex(bwenv.BWEnvError, "sync"):
             bwenv.VaultResolver(runner=sync_failure, sync=True).resolve("op://Infra/service/token")
+
+    def test_explicit_session_can_prove_readability_when_status_falsely_reports_locked(self):
+        def false_locked(args, env):
+            self.assertEqual("session-sentinel", env.get("BW_SESSION"))
+            if args == ["status"]:
+                return '{"status":"locked"}'
+            if args == ["list", "organizations"]:
+                return bwenv.json.dumps(self.orgs)
+            if args == ["list", "items"]:
+                return bwenv.json.dumps(self.items)
+            raise AssertionError(args)
+
+        resolver = bwenv.VaultResolver(
+            runner=false_locked, session="session-sentinel", sync=False
+        )
+        self.assertEqual("custom-token", resolver.resolve("op://Infra/service/token"))
+
+    def test_explicit_session_still_fails_closed_when_real_vault_read_fails(self):
+        def unusable(args, env):
+            if args == ["status"]:
+                return '{"status":"locked"}'
+            if args == ["list", "organizations"]:
+                raise bwenv.BWEnvError("Bitwarden command failed: list organizations")
+            raise AssertionError(args)
+
+        with self.assertRaisesRegex(bwenv.BWEnvError, "list organizations"):
+            bwenv.VaultResolver(
+                runner=unusable, session="expired-session", sync=False
+            ).resolve("op://Infra/service/token")
 
 
 class InjectTests(unittest.TestCase):
