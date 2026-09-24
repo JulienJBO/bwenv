@@ -26,7 +26,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 from urllib.parse import quote
 
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 URI_MATCH_EXACT = 3
 OP_URI_PATTERN = re.compile(r"^op://([^/]+)/([^/]+)/(.+)$")
 ENV_FILE_LINE_PATTERN = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
@@ -191,6 +191,16 @@ def _default_bw_runner(args: list[str], env: Mapping[str, str]) -> str:
     except FileNotFoundError as error:
         raise BWEnvError("Bitwarden CLI 'bw' was not found") from error
     if result.returncode != 0:
+        # Bitwarden CLI can return a non-zero exit code for `bw status` while still
+        # emitting a complete JSON status document. Preserve that document so callers
+        # can decide from its contents instead of treating the process code as truth.
+        if args == ["status"]:
+            try:
+                status = json.loads(result.stdout)
+            except (json.JSONDecodeError, TypeError):
+                status = None
+            if isinstance(status, dict) and isinstance(status.get("status"), str):
+                return result.stdout
         raise BWEnvError(f"Bitwarden command failed: {' '.join(args[:2])}")
     return result.stdout
 
@@ -228,7 +238,14 @@ class VaultResolver:
             status = json.loads(self._run(["status"]))
         except json.JSONDecodeError as error:
             raise BWEnvError("Bitwarden returned invalid status JSON") from error
-        if not isinstance(status, dict) or status.get("status") != "unlocked":
+        if not isinstance(status, dict):
+            raise BWEnvError("Bitwarden returned invalid status JSON")
+        # On recent macOS/Bitwarden CLI combinations, `bw status` can report
+        # "locked" even when an explicit BW_SESSION can still decrypt the local vault.
+        # Without an explicit session we remain fail-closed immediately. With one, the
+        # next real vault operation (sync/list/get) is the authority and will fail closed
+        # if the session is actually unusable.
+        if status.get("status") != "unlocked" and not self.session:
             raise BWEnvError("Bitwarden vault is not unlocked; refresh the configured session")
         if self.sync:
             self._run(["sync"])
@@ -595,7 +612,14 @@ class VaultImportWriter:
             status = json.loads(self._run(["status"]))
         except json.JSONDecodeError as error:
             raise BWEnvError("Bitwarden returned invalid status JSON") from error
-        if not isinstance(status, dict) or status.get("status") != "unlocked":
+        if not isinstance(status, dict):
+            raise BWEnvError("Bitwarden returned invalid status JSON")
+        # On recent macOS/Bitwarden CLI combinations, `bw status` can report
+        # "locked" even when an explicit BW_SESSION can still decrypt the local vault.
+        # Without an explicit session we remain fail-closed immediately. With one, the
+        # next real vault operation (sync/list/get) is the authority and will fail closed
+        # if the session is actually unusable.
+        if status.get("status") != "unlocked" and not self.session:
             raise BWEnvError("Bitwarden vault is not unlocked; refresh the configured session")
         if self.sync:
             self._run(["sync"])
