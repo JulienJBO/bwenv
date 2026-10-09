@@ -1,7 +1,7 @@
 # bwenv
 
 `bwenv` resolves 1Password-style `op://` references from Bitwarden or
-Vaultwarden through the official `bw` CLI. Version `2.0.0` is intended for
+Vaultwarden through the official `bw` CLI. Version `2.2.0` is intended for
 local use and a GitHub Actions self-hosted macOS runner running as the same
 user that owns the Keychain entry; hosted GitHub runners and other users are
 not supported.
@@ -40,6 +40,43 @@ python3 bwenv.py --keychain-service bwenv.bitwarden-poc.kefapps.wtf read \
 The stored session can expire or be revoked. Refresh it interactively with
 `keychain set-session`; `bwenv` deliberately fails rather than prompting from
 a background process.
+
+## Fast, bounded vault synchronization
+
+The first `bwenv read`, `run`, or `inject` synchronizes through the official
+Bitwarden CLI. Successful syncs are then reused for **5 minutes** by other
+`bwenv` processes using the same server and account. The check is guarded by an
+OS file lock to prevent simultaneous agents from each starting a network sync.
+
+Only a one-byte success marker and its timestamp are persisted in
+`~/.cache/bwenv/` (or `$XDG_CACHE_HOME/bwenv/`): **no decrypted items,
+credentials, sessions, or secret values are cached by bwenv**. Each read still
+consults the official CLI's local encrypted vault. The cache directory and
+marker require owner-only permissions.
+
+```sh
+# Fast local reads after an initial successful sync:
+bwenv read bw://Infra/service/token
+
+# Mandatory immediately after rotating a credential in Vaultwarden:
+bwenv --force-sync read bw://Infra/service/token
+
+# Strictly offline/local read, even when no recent sync exists:
+bwenv --no-sync read bw://Infra/service/token
+
+# Restore the prior policy (sync every time):
+BWENV_SYNC_TTL_SECONDS=0 bwenv read bw://Infra/service/token
+```
+
+Set `BWENV_SYNC_TTL_SECONDS` to a non-negative integer to change the
+default 300-second freshness window. A failed sync is **never** recorded as
+successful; it fails closed. If account identity is unavailable from `bw
+status`, every ordinary call synchronizes rather than trusting a shared
+marker. After a key rotation, use `--force-sync` explicitly: a recently
+synchronized local vault may still contain the preceding key.
+
+Performance depends on the local `bw` CLI and vault size; the TTL removes
+the repeated network roundtrip but does not cache or skip local item lookup.
 
 ## Reference resolution
 
