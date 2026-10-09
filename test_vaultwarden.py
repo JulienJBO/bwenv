@@ -575,7 +575,7 @@ class InstallerTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertEqual("bwenv 2.1.0\n", result.stdout)
+            self.assertEqual("bwenv 2.2.0\n", result.stdout)
             source.unlink()
             result = subprocess.run(
                 [str(installed), "--version"],
