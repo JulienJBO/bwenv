@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import fcntl
 import json
 import os
 import re
@@ -20,13 +21,14 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 from urllib.parse import quote
 
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 URI_MATCH_EXACT = 3
 OP_URI_PATTERN = re.compile(r"^op://([^/]+)/([^/]+)/(.+)$")
 ENV_FILE_LINE_PATTERN = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
@@ -36,6 +38,30 @@ TEMPLATE_REFERENCE_PATTERN = re.compile(
     r"(" + SECRET_REFERENCE_SCHEME + r"[A-Za-z0-9._~-]+/[A-Za-z0-9._~-]+/[A-Za-z0-9._~/%-]+)"
 )
 KEYCHAIN_ACCOUNT = "BW_SESSION"
+DEFAULT_SYNC_TTL_SECONDS = 300  # The last successful sync is shared across processes.
+
+
+def _sync_ttl_seconds() -> int:
+    """Return how long a *successful* vault sync may be reused, without caching secrets."""
+    raw = os.environ.get("BWENV_SYNC_TTL_SECONDS", str(DEFAULT_SYNC_TTL_SECONDS))
+    if not raw.isdecimal():
+        raise BWEnvError("BWENV_SYNC_TTL_SECONDS must be a non-negative integer")
+    return int(raw)
+
+
+def _sync_state_path(status: Mapping[str, object]) -> Path | None:
+    """Isolate sync freshness by account and server, never by a secret or a session token."""
+    user_id = status.get("userId")
+    if not isinstance(user_id, str) or not user_id:
+        return None  # Cannot establish identity: always sync, never trust a shared marker.
+    server = status.get("serverUrl")
+    if not isinstance(server, str):
+        server = ""
+    scope = json.dumps([server, user_id], separators=(",", ":"))
+    digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return base / "bwenv" / f"sync-{digest}.state"
+
 
 
 class BWEnvError(RuntimeError):
@@ -199,10 +225,12 @@ class VaultResolver:
     """Fail-closed resolver using the official Bitwarden CLI JSON output."""
 
     def __init__(self, *, runner: Callable[[list[str], Mapping[str, str]], str] = _default_bw_runner,
-                 session: str | None = None, sync: bool = True):
+                 session: str | None = None, sync: bool = True,
+                 force_sync: bool = False):
         self.runner = runner
         self.session = session
         self.sync = sync
+        self.force_sync = force_sync
         self._prepared = False
         self._organizations: list[dict] | None = None
         self._items: list[dict] | None = None
@@ -221,6 +249,46 @@ class VaultResolver:
         except Exception as error:
             raise BWEnvError(f"Bitwarden command failed: {' '.join(args[:2])}") from error
 
+    def _sync_once_per_ttl(self, status: dict) -> None:
+        """Serialize refreshes across agents. Cache only a 1-byte success marker, no secrets."""
+        ttl = _sync_ttl_seconds()
+        state = _sync_state_path(status)
+        if ttl == 0 or state is None:
+            self._run(["sync"])
+            return
+
+        try:
+            state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # Never trust a publicly writable cache directory or follow a marker symlink.
+            folder = state.parent.stat()
+            if folder.st_uid != os.getuid() or folder.st_mode & 0o077:
+                raise BWEnvError("bwenv sync state directory has unsafe permissions")
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(state, flags, 0o600)
+        except OSError:
+            # The cache is only an optimization. Without it, preserve a fresh sync.
+            self._run(["sync"])
+            return
+
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            metadata = os.fstat(fd)
+            if metadata.st_mode & 0o077:
+                raise BWEnvError("bwenv sync state has unsafe permissions")
+            age = time.time() - metadata.st_mtime
+            if (not self.force_sync and metadata.st_size == 1 and
+                    0 <= age < ttl):
+                return
+
+            # A failure or crash never marks the cache fresh. flock is released by the OS.
+            self._run(["sync"])
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, b"1")
+            os.ftruncate(fd, 1)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
     def _prepare(self) -> None:
         if self._prepared:
             return
@@ -231,7 +299,7 @@ class VaultResolver:
         if not isinstance(status, dict) or status.get("status") != "unlocked":
             raise BWEnvError("Bitwarden vault is not unlocked; refresh the configured session")
         if self.sync:
-            self._run(["sync"])
+            self._sync_once_per_ttl(status)
         self._prepared = True
 
     def _organizations_list(self) -> list[dict]:
@@ -987,11 +1055,14 @@ def _resolver_from_args(args: argparse.Namespace) -> VaultResolver:
         except KeychainError:
             if getattr(args, "keychain_service", None):
                 raise
-    return VaultResolver(session=session, sync=not args.no_sync)
+    return VaultResolver(session=session, sync=not args.no_sync,
+                         force_sync=args.force_sync)
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--no-sync", action="store_true", help="do not run bw sync before resolving")
+    parser.add_argument("--no-sync", action="store_true", help="read local vault without syncing")
+    parser.add_argument("--force-sync", action="store_true",
+                        help="synchronize now, ignoring the 5-minute shared freshness window")
     parser.add_argument("--keychain-service", help="read BW_SESSION from this macOS Keychain service")
 
 
@@ -1040,6 +1111,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.no_sync and args.force_sync:
+            raise BWEnvError("--no-sync and --force-sync cannot be combined")
         if args.command == "keychain":
             store = KeychainSessionStore(args.service)
             if args.keychain_command == "set-session":
