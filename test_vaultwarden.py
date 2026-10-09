@@ -174,6 +174,162 @@ class VaultResolverTests(unittest.TestCase):
             bwenv.VaultResolver(runner=sync_failure, sync=True).resolve("op://Infra/service/token")
 
 
+
+
+class SharedSyncTests(unittest.TestCase):
+    """Cross-process refresh throttling: the cache holds a marker, never the vault."""
+
+    def setUp(self):
+        self.organizations = [{"id": "infra-id", "name": "Infra"}]
+        self.items = [item("service", "infra-id", fields=[{"name": "token", "value": "secret-sentinel"}])]
+        self.calls = []
+        self.fail_next_sync = False
+
+    def runner(self, args, env):
+        self.calls.append(tuple(args))
+        if args == ["status"]:
+            return bwenv.json.dumps({
+                "status": "unlocked",
+                "userId": "user-1",
+                "serverUrl": "https://vaultwarden.example.test",
+            })
+        if args == ["sync"]:
+            if self.fail_next_sync:
+                self.fail_next_sync = False
+                raise bwenv.BWEnvError("Bitwarden command failed: sync")
+            return ""
+        if args == ["list", "organizations"]:
+            return bwenv.json.dumps(self.organizations)
+        if args == ["list", "items"]:
+            return bwenv.json.dumps(self.items)
+        raise AssertionError(args)
+
+    def read(self, **options):
+        resolver = bwenv.VaultResolver(runner=self.runner, **options)
+        self.assertEqual("secret-sentinel", resolver.resolve("bw://Infra/service/token"))
+
+    def sync_count(self):
+        return self.calls.count(("sync",))
+
+    def test_reuses_one_sync_between_independent_resolvers(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_CACHE_HOME": directory}, clear=False
+        ):
+            self.read()
+            self.read()
+            self.assertEqual(1, self.sync_count())
+            state = list((Path(directory) / "bwenv").glob("sync-*.state"))
+            self.assertEqual(1, len(state))
+            self.assertEqual(b"1", state[0].read_bytes())
+            self.assertEqual(0o600, stat.S_IMODE(state[0].stat().st_mode))
+            self.assertEqual(0o700, stat.S_IMODE(state[0].parent.stat().st_mode))
+            self.assertNotIn(b"secret-sentinel", state[0].read_bytes())
+
+    def test_force_sync_is_for_credential_rotations(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_CACHE_HOME": directory}, clear=False
+        ):
+            self.read()
+            self.read(force_sync=True)
+            self.assertEqual(2, self.sync_count())
+
+    def test_expired_marker_triggers_a_new_sync(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_CACHE_HOME": directory}, clear=False
+        ):
+            self.read()
+            marker = next((Path(directory) / "bwenv").glob("sync-*.state"))
+            old = bwenv.time.time() - 3600
+            os.utime(marker, (old, old))
+            self.read()
+            self.assertEqual(2, self.sync_count())
+
+    def test_failed_sync_is_never_cached_as_success(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_CACHE_HOME": directory}, clear=False
+        ):
+            self.fail_next_sync = True
+            with self.assertRaisesRegex(bwenv.BWEnvError, "sync"):
+                self.read()
+            self.read()
+            self.assertEqual(2, self.sync_count())
+
+    def test_no_sync_bypasses_even_the_freshness_marker(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_CACHE_HOME": directory}, clear=False
+        ):
+            self.read(sync=False)
+            self.assertEqual(0, self.sync_count())
+            self.assertFalse((Path(directory) / "bwenv").exists())
+
+    def test_disabling_ttl_preserves_legacy_sync_per_read(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_CACHE_HOME": directory, "BWENV_SYNC_TTL_SECONDS": "0"}
+        ):
+            self.read()
+            self.read()
+            self.assertEqual(2, self.sync_count())
+
+    def test_bad_ttl_fails_closed_without_secret_logging(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_CACHE_HOME": directory, "BWENV_SYNC_TTL_SECONDS": "-1"}
+        ):
+            with self.assertRaisesRegex(bwenv.BWEnvError, "BWENV_SYNC_TTL_SECONDS") as exc:
+                self.read()
+            self.assertNotIn("secret-sentinel", str(exc.exception))
+
+    def test_identity_change_requires_new_sync(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_CACHE_HOME": directory}, clear=False
+        ):
+            self.read()
+            def another_account(args, env):
+                if args == ["status"]:
+                    return bwenv.json.dumps({
+                        "status": "unlocked", "userId": "user-2",
+                        "serverUrl": "https://vaultwarden.example.test",
+                    })
+                return self.runner(args, env)
+            self.assertEqual("secret-sentinel", bwenv.VaultResolver(runner=another_account).resolve(
+                "bw://Infra/service/token"
+            ))
+            self.assertEqual(2, self.sync_count())
+
+    def test_concurrent_reads_share_one_sync(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_CACHE_HOME": directory}, clear=False
+        ):
+            gate = threading.Barrier(6)
+            original = self.runner
+
+            def slow_sync(args, env):
+                if args == ["sync"]:
+                    bwenv.time.sleep(0.06)
+                return original(args, env)
+
+            def worker(_):
+                gate.wait(timeout=5)
+                return bwenv.VaultResolver(runner=slow_sync).resolve(
+                    "bw://Infra/service/token"
+                )
+
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                self.assertEqual(["secret-sentinel"] * 6, list(pool.map(worker, range(6))))
+            self.assertEqual(1, self.sync_count())
+
+    def test_cli_force_sync_and_no_sync_conflict(self):
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            self.assertEqual(1, bwenv.main(["--no-sync", "--force-sync", "read",
+                                            "bw://Infra/service/token"]))
+        self.assertIn("cannot be combined", stderr.getvalue())
+
+
+
+
 class InjectTests(unittest.TestCase):
     def setUp(self):
         self.resolver = bwenv.VaultResolver(
